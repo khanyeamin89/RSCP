@@ -55,7 +55,7 @@ MILESTONE_LABELS = {
     "PIC": "PIC – Flushing / Pipe Internal Cleaning",
     "HT": "HT – Hydraulic Test",
     "PT": "PT – Pneumatic Test",
-    "SAW": "SAW – System Acceptance Walkdown",
+    "SAW": "SAW – Start-Up and Adjustment Works",
 }
 
 SCOPE_MILESTONES = {
