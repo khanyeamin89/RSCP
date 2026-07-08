@@ -1,97 +1,20 @@
 import streamlit as st
-from config import get_supabase_client
+from supabase import create_client
 
+@st.cache_resource
+def get_supabase_client():
+    return create_client(st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_KEY"])
 
-def insert_records_to_supabase(records_list: list) -> bool:
-    """Ingests an array of structured dictionary records and performs a bulk insert
-
-    transaction into the target Supabase relational table ('rscp_logs') with expanded
-    commissioning fields.
-    """
-    if not records_list:
-        st.warning(
-            "Database layer execution bypassed: Ingested record array is empty."
-        )
-        return False
-
+def upsert_registry_row(row: dict):
     supabase = get_supabase_client()
+    # UPSERT: If system+component exists, it merges automatically
+    supabase.table("registry").upsert(row, on_conflict="system,component").execute()
 
-    sanitized_records = []
-    required_keys = {
-        "tag_id",
-        "system",
-        "loop_number",
-        "description",
-        "status",
-        "system_kks",
-        "equipment_kks",
-        "commissioning_stage",
-        "test_remarks",
-        "execution_date",
-    }
+def check_chunk_exists(file_hash, chunk_index):
+    res = get_supabase_client().table("processed_chunks").select("id")\
+        .eq("file_hash", file_hash).eq("chunk_index", chunk_index).execute()
+    return len(res.data) > 0
 
-    for idx, record in enumerate(records_list):
-        if not isinstance(record, dict):
-            continue
-
-        # Map and sanitize fields
-        clean_record = {key: record.get(key, "") for key in required_keys}
-
-        if not clean_record["system"]:
-            clean_record["system"] = "General"
-        if clean_record["status"] not in [
-            "Pending",
-            "In Progress",
-            "Verified",
-            "Failed",
-        ]:
-            clean_record["status"] = "Pending"
-
-        # Ensure date string is None rather than empty to prevent database casting failures
-        if not clean_record["execution_date"]:
-            clean_record["execution_date"] = None
-
-        sanitized_records.append(clean_record)
-
-    try:
-        response = (
-            supabase.table("rscp_logs").insert(sanitized_records).execute()
-        )
-        if hasattr(response, "data") and response.data:
-            return True
-        else:
-            st.error(
-                "Database Transaction Failure: Operation completed but no confirmation rows were generated."
-            )
-            return False
-
-    except Exception as db_transaction_error:
-        st.error(
-            f"Critical Database Write Exception Raised: {str(db_transaction_error)}"
-        )
-        return False
-
-
-def fetch_all_records_from_supabase() -> list:
-    """Queries the master 'rscp_logs' table, retrieving the full historical sequence
-
-    including KKS metadata and commissioning stages sorted chronologically.
-    """
-    supabase = get_supabase_client()
-    try:
-        response = (
-            supabase.table("rscp_logs")
-            .select(
-                "id, tag_id, system, loop_number, description, status, system_kks, equipment_kks, commissioning_stage, test_remarks, execution_date, created_at"
-            )
-            .order("created_at", descending=True)
-            .execute()
-        )
-        if hasattr(response, "data"):
-            return response.data
-        return []
-    except Exception as db_query_error:
-        st.error(
-            f"Critical Database Read Exception Raised: {str(db_query_error)}"
-        )
-        return []
+def mark_chunk_done(file_hash, chunk_index):
+    get_supabase_client().table("processed_chunks").insert(
+        {"file_hash": file_hash, "chunk_index": chunk_index}).execute()
