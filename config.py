@@ -3,7 +3,8 @@ from supabase import create_client, Client
 
 SHOP_NAME = "Reactor Shop"
 BUCKET_NAME = "commissioning-files"
-OLLAMA_URL = "http://localhost:11434/api/generate"
+# Fall back to localhost if the cloud secret isn't defined
+OLLAMA_URL = st.secrets.get("OLLAMA_URL", "http://localhost:11434/api/generate")
 
 MILESTONES_ALL = ["IT", "PIC", "HT", "PT", "SAW"]
 
