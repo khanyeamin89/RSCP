@@ -206,7 +206,7 @@ OLLAMA_URL = "http://localhost:11434/api/generate"
 
 def parse_commissioning_note_with_ai(user_input_text: str):
     try:
-        prompt = f\"\"\"
+        prompt = f"""
         You are a commissioning data extractor at a nuclear power plant Reactor Shop.
         All equipment and systems here are ALREADY INSTALLED. Only commissioning
         test work remains: IT (Individual Testing), PIC (Flushing/pipe cleaning),
@@ -239,7 +239,7 @@ def parse_commissioning_note_with_ai(user_input_text: str):
             "SAW_Status": "status or null",
             "Comments": "Brief summary of the note"
         }}
-        \"\"\"
+        """
         response = requests.post(
             OLLAMA_URL,
             json={"model": "llama3.2", "prompt": prompt, "stream": False, "format": "json"},
@@ -278,12 +278,11 @@ def _extract_system_name(raw: pd.DataFrame, fallback: str):
     return fallback
 
 def _system_kks_from_sheetname(sheet_name: str):
-    m = re.match(r"^\\s*\\d+\\s*\\.?\\s*(.*)$", sheet_name)
+    m = re.match(r"^\s*\d+\s*\.?\s*(.*)$", sheet_name)
     return m.group(1).strip() if m else sheet_name.strip()
 
 def parse_raw_dataframe(raw: pd.DataFrame, source_label: str) -> list:
     rows = []
-    # If file contains headers matching our direct db matrix format, map them 1:1
     if "System" in raw.columns and "Component" in raw.columns and any(f"{m}_Status" in raw.columns for m in MILESTONES_ALL):
         for _, r in raw.iterrows():
             row = {c: (r[c] if c in raw.columns and pd.notna(r[c]) else "") for c in REGISTRY_COLUMNS}
@@ -297,7 +296,6 @@ def parse_raw_dataframe(raw: pd.DataFrame, source_label: str) -> list:
             rows.append(row)
         return rows
 
-    # Fall back to structural legacy sheet scanning rules
     header_idx = _find_header_row(raw)
     if header_idx is not None:
         header_row = raw.iloc[header_idx]
@@ -340,7 +338,6 @@ def parse_workbook_or_csv(file_bytes, file_name: str):
     rows, skipped = [], []
     if file_name.lower().endswith(".csv"):
         try:
-            # Lookahead check for row structure headers
             try:
                 test_df = pd.read_csv(io.BytesIO(file_bytes))
                 if "System" in test_df.columns and "Component" in test_df.columns:
@@ -371,14 +368,14 @@ def parse_workbook_or_csv(file_bytes, file_name: str):
 # =============================================================================
 # 7. HEADER VIEWPORT
 # =============================================================================
-st.markdown(f\"\"\"
+st.markdown(f"""
 <div class="main-header">
   <h1>⚛️ {SHOP_NAME} — Commissioning Progress Dashboard</h1>
   <p>All systems and equipment in this registry are already installed. Tracking covers commissioning
   test milestones only: IT, PIC (flushing), HT, PT, and SAW. Data is stored in Supabase and persists
   across sessions and deployments.</p>
 </div>
-\"\"\", unsafe_allow_html=True)
+""", unsafe_allow_html=True)
 
 with st.expander("ℹ️ Milestone abbreviations"):
     for m in MILESTONES_ALL:
@@ -561,13 +558,13 @@ if not db.empty:
         ("Milestones Failed", failed_count, "needs attention" if failed_count else "none flagged"),
     ]
     for col, (label, value, sub) in zip([k1, k2, k3, k4, k5], kpi_data):
-        col.markdown(f\"\"\"
+        col.markdown(f"""
         <div class="kpi-card">
             <div class="kpi-label">{label}</div>
             <div class="kpi-value">{value}</div>
             <div class="kpi-sub">{sub}</div>
         </div>
-        \"\"\", unsafe_allow_html=True)
+        """, unsafe_allow_html=True)
 
     st.markdown("###")
     tab_charts, tab_matrix, tab_logs, tab_master = st.tabs(["📈 Progress Overview", "🧩 Commissioning Status Matrix", "🧪 Test Logs", "📋 Master Registry"])
@@ -599,7 +596,7 @@ if not db.empty:
             html_rows = []
             for _, r in view.sort_values(["System", "Component"]).iterrows():
                 cells = "".join(f"<td>{badge(r[f'{m}_Status'])}</td>" for m in MILESTONES_ALL)
-                html_rows.append(f\"\"\"
+                html_rows.append(f"""
                 <tr>
                     <td><b>{r['System']}</b><br><span style="color:#94a3b8;font-size:0.75rem;">{r['System_KKS']}</span></td>
                     <td>{r['Component']}</td>
@@ -607,9 +604,9 @@ if not db.empty:
                     {cells}
                     <td><b>{r['Progress_%']:.0f}%</b></td>
                     <td style="max-width:220px;color:#64748b;font-size:0.8rem;">{r['Comments']}</td>
-                </tr>\"\"\")
+                </tr>""")
             header_cells = "".join(f"<th>{m}</th>" for m in MILESTONES_ALL)
-            table_html = f\"\"\"<table class="matrix-table"><thead><tr><th>System</th><th>Component</th><th>Scope</th>{header_cells}<th>Progress</th><th>Remarks</th></tr></thead><tbody>{''.join(html_rows)}</tbody></table>\"\"\"
+            table_html = f"""<table class="matrix-table"><thead><tr><th>System</th><th>Component</th><th>Scope</th>{header_cells}<th>Progress</th><th>Remarks</th></tr></thead><tbody>{''.join(html_rows)}</tbody></table>"""
             st.markdown(table_html, unsafe_allow_html=True)
 
     with tab_logs:
