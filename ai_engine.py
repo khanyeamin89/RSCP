@@ -6,8 +6,8 @@ import docx  # From python-docx library
 import streamlit as st
 
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
-# Flagship model optimized for high-density industrial and technical nomenclature
-MODEL_NAME = "llama-3.3-70b-specdec"
+# Swapped to the active, stable flagship model on Groq's LPU infrastructure
+MODEL_NAME = "llama-3.3-70b-versatile"
 
 def ask_cloud_ai_to_parse_chunk(prompt_content: str) -> list:
     """
@@ -52,7 +52,7 @@ def ask_cloud_ai_to_parse_chunk(prompt_content: str) -> list:
             {"role": "system", "content": system_instruction},
             {"role": "user", "content": prompt_content},
         ],
-        "temperature": 0.0, # Purely deterministic output
+        "temperature": 0.0, # Complete determinism for industrial engineering structures
         "response_format": {"type": "json_object"},
     }
 
@@ -94,37 +94,30 @@ def universal_ai_file_parser(file_bytes: bytes, file_name: str) -> list:
     raw_text = ""
 
     try:
-        # STRATEGY 1: Plain text file profiles
         if file_extension in ["txt", "log", "csv"]:
             raw_text = file_bytes.decode("utf-8", errors="ignore")
             
-        # STRATEGY 2: Excel Spreadsheet structures
         elif file_extension in ["xlsx", "xls"]:
             excel_stream = io.BytesIO(file_bytes)
-            # Fetch all worksheets inside the document file
             excel_workbook = pd.read_excel(excel_stream, sheet_name=None, dtype=str)
             
             text_layers = []
             for sheet_name, dataframe in excel_workbook.items():
-                dataframe = dataframe.dropna(how='all') # Clean completely dead rows
+                dataframe = dataframe.dropna(how='all')
                 if not dataframe.empty:
                     text_layers.append(f"\n--- [EXCEL WORKSHEET: {sheet_name}] ---")
-                    # Express tables as standard comma separated values for efficient LLM processing
                     text_layers.append(dataframe.to_csv(index=False))
             raw_text = "\n".join(text_layers)
 
-        # STRATEGY 3: Word Document profiles
         elif file_extension == "docx":
             word_stream = io.BytesIO(file_bytes)
             doc_object = docx.Document(word_stream)
             text_layers = []
             
-            # Step 1: Ingest text block elements
             for paragraph in doc_object.paragraphs:
                 if paragraph.text.strip():
                     text_layers.append(paragraph.text)
                     
-            # Step 2: Extract nested matrix tables embedded in document structures
             for table in doc_object.tables:
                 text_layers.append("\n[EMBEDDED TABLE CONTEXT]")
                 for row in table.rows:
@@ -147,7 +140,6 @@ def universal_ai_file_parser(file_bytes: bytes, file_name: str) -> list:
         st.warning(f"Aborted execution: '{file_name}' did not yield any valid text strings.")
         return []
 
-    # Stream batch chunks safely into context windows
     max_chunk_size = 65000
     all_extracted_records = []
     total_chars = len(clean_text)
