@@ -9,26 +9,24 @@ from ai_engine import universal_ai_file_parser
 st.set_page_config(page_title=PAGE_TITLE, page_icon=PAGE_ICON, layout="wide")
 apply_custom_css()
 
-# Dashboard Main Header Construction Layout
 st.title("⚛️ Reactor Shop Commissioning & Loop Tracking Dashboard")
 st.markdown("Automated Structured Logging and Telemetry Records Extraction Framework")
 st.markdown("---")
 
-# Establish Main Workspace Functional Divisions via Tabs
 tab1, tab2 = st.tabs(["🚀 Process New Logs / Documentation", "📊 Live Database Analytics & Monitoring"])
 
 with tab1:
     st.subheader("Data Extraction Engine")
     st.markdown(
-        "Upload raw system walkdown checklists, loop validation logs, sequence reports, or sensor "
-        "diagnostic printouts. The cloud AI engine will read, map, and transform the documents into structured records."
+        "Upload system checklists, loop sheets, engineering printouts, or operational reports. "
+        "Supported types: **Plain Text (`.txt`, `.log`), Spreadsheet Sheets (`.csv`, `.xlsx`, `.xls`), and Word Documents (`.docx`)**."
     )
 
-    # File Upload Node Component
+    # Expanded File Upload Node Component
     uploaded_file = st.file_uploader(
-        "Drop operational file here (.txt, .log, .csv)", 
-        type=["txt", "log", "csv"],
-        help="Ensure document file uses UTF-8 standard encoding format."
+        "Drop operational file here", 
+        type=["txt", "log", "csv", "xlsx", "xls", "docx"],
+        help="System auto-extracts data models from text logs, excel charts, and word blocks seamlessly."
     )
 
     if uploaded_file is not None:
@@ -38,17 +36,15 @@ with tab1:
             file_bytes = uploaded_file.getvalue()
             file_name = uploaded_file.name
 
-            # Process document extraction pipeline
+            # Core ingestion run
             extracted_data = universal_ai_file_parser(file_bytes, file_name)
 
             if extracted_data:
                 st.markdown("### Previewing Processed Records Output")
                 st.success(f"Successfully processed {len(extracted_data)} structured database items!")
 
-                # Parse data into dataframe for structured visualization view
                 df_preview = pd.DataFrame(extracted_data)
                 
-                # Re-order columns strictly for UI consistency
                 columns_order = ["tag_id", "system", "loop_number", "description", "status"]
                 for col in columns_order:
                     if col not in df_preview.columns:
@@ -57,35 +53,28 @@ with tab1:
 
                 st.dataframe(df_preview, use_container_width=True)
 
-                # Commit modifications directly to active Supabase tables
                 with st.spinner("Executing transactional database sync to Supabase..."):
                     db_success = insert_records_to_supabase(extracted_data)
                     if db_success:
                         st.success("Production database tables successfully updated and synchronized!")
-                        # Force clear metrics caches to refresh visualization tab
                         if hasattr(st, "cache_data"):
                             st.cache_data.clear()
             else:
-                st.error("AI parsing process completed but generated zero records. Check your Groq API key configuration and log contents.")
+                st.error("AI parsing process completed but generated zero records. Verify data alignments inside your document.")
 
 with tab2:
     st.subheader("Live Plant Component Status Tracking")
 
-    # Fetch rows from the live database
     raw_db_rows = fetch_all_records_from_supabase()
 
     if raw_db_rows:
         df_master = pd.DataFrame(raw_db_rows)
-        
-        # Ensure proper schema evaluation layout
         columns_layout = ["tag_id", "system", "loop_number", "description", "status", "created_at"]
         for col in columns_layout:
             if col not in df_master.columns:
                 df_master[col] = ""
         
-        # High level system analytical KPIs Metrics Layout Grid
         m_col1, m_col2, m_col3, m_col4 = st.columns(4)
-        
         total_items = len(df_master)
         verified_count = len(df_master[df_master["status"] == "Verified"])
         progress_count = len(df_master[df_master["status"] == "In Progress"])
@@ -97,13 +86,10 @@ with tab2:
         m_col4.metric("Non-Conformance/Failed ❌", failed_count, delta=f"-{failed_count} faults detected", delta_color="inverse")
 
         st.markdown("---")
-        
-        # Layout Division for Visual Graphs and Structural Search Filters
         graph_col, filter_col = st.columns([2, 1])
         
         with graph_col:
             st.markdown("#### System Validation Distribution Status")
-            # Build an elegant status chart via Altair
             status_counts = df_master["status"].value_counts().reset_index()
             status_counts.columns = ["Status", "Count"]
             
@@ -124,19 +110,14 @@ with tab2:
 
         with filter_col:
             st.markdown("#### Database View Search Filters")
-            
-            # Interactive System Groupings Filter
             available_systems = sorted(list(df_master["system"].unique()))
             system_selection = st.multiselect(
                 "Filter Display by Systems:",
                 options=available_systems,
                 default=available_systems
             )
-            
-            # Search input field context lookup matching tags
             search_query = st.text_input("Search Component via Tag ID:", value="", placeholder="e.g. 10UJA").strip()
 
-        # Apply filtering parameters matrix arrays
         filtered_df = df_master[df_master["system"].isin(system_selection)]
         if search_query:
             filtered_df = filtered_df[filtered_df["tag_id"].str.contains(search_query, case=False, na=False)]
@@ -144,14 +125,12 @@ with tab2:
         st.markdown("---")
         st.markdown(f"Showing **{len(filtered_df)}** filtered record listings:")
 
-        # Render Core Interactive Main Data Table Frame
         st.dataframe(
             filtered_df[["tag_id", "system", "loop_number", "description", "status"]],
             use_container_width=True,
             height=400
         )
         
-        # Data Export Functionality
         csv_data = filtered_df[["tag_id", "system", "loop_number", "description", "status"]].to_csv(index=False).encode('utf-8')
         st.download_button(
             label="📥 Export Current Filtered Table view to CSV",
@@ -159,6 +138,5 @@ with tab2:
             file_name="rscp_commissioning_filtered_report.csv",
             mime="text/csv"
         )
-        
     else:
         st.info("No logs are currently stored in the Supabase database. Head over to the extraction tab to upload data sheets.")
