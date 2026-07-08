@@ -101,8 +101,8 @@ TESTLOG_DB_TO_PY = {v: k for k, v in TESTLOG_PY_TO_DB.items()}
 # =============================================================================
 @st.cache_resource
 def get_supabase_client() -> Client:
-    url = st.secrets["SUPABASE_URL"]
-    key = st.secrets["SUPABASE_KEY"]
+    url = st.secrets["https://ccflqpamuyjwrithqkhi.supabase.co"]
+    key = st.secrets["eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImNjZmxxcGFtdXlqd3JpdGhxa2hpIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODM0Nzc1NzksImV4cCI6MjA5OTA1MzU3OX0.g8Xf056IIDHpT-vGtvsocRbo6yhLuevLvlVP0GN360s"]
     return create_client(url, key)
 
 try:
