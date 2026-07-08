@@ -5,7 +5,8 @@ from config import get_supabase_client
 def insert_records_to_supabase(records_list: list) -> bool:
     """Ingests an array of structured dictionary records and performs a bulk insert
 
-    transaction into the target Supabase relational table ('rscp_logs').
+    transaction into the target Supabase relational table ('rscp_logs') with expanded
+    commissioning fields.
     """
     if not records_list:
         st.warning(
@@ -16,12 +17,26 @@ def insert_records_to_supabase(records_list: list) -> bool:
     supabase = get_supabase_client()
 
     sanitized_records = []
-    required_keys = {"tag_id", "system", "loop_number", "description", "status"}
+    required_keys = {
+        "tag_id",
+        "system",
+        "loop_number",
+        "description",
+        "status",
+        "system_kks",
+        "equipment_kks",
+        "commissioning_stage",
+        "test_remarks",
+        "execution_date",
+    }
 
     for idx, record in enumerate(records_list):
         if not isinstance(record, dict):
             continue
+
+        # Map and sanitize fields
         clean_record = {key: record.get(key, "") for key in required_keys}
+
         if not clean_record["system"]:
             clean_record["system"] = "General"
         if clean_record["status"] not in [
@@ -31,6 +46,10 @@ def insert_records_to_supabase(records_list: list) -> bool:
             "Failed",
         ]:
             clean_record["status"] = "Pending"
+
+        # Ensure date string is None rather than empty to prevent database casting failures
+        if not clean_record["execution_date"]:
+            clean_record["execution_date"] = None
 
         sanitized_records.append(clean_record)
 
@@ -54,16 +73,16 @@ def insert_records_to_supabase(records_list: list) -> bool:
 
 
 def fetch_all_records_from_supabase() -> list:
-    """Queries the master 'rscp_logs' relational table, retrieving the full
+    """Queries the master 'rscp_logs' table, retrieving the full historical sequence
 
-    historical sequence of logged entries sorted chronologically.
+    including KKS metadata and commissioning stages sorted chronologically.
     """
     supabase = get_supabase_client()
     try:
         response = (
             supabase.table("rscp_logs")
             .select(
-                "id, tag_id, system, loop_number, description, status, created_at"
+                "id, tag_id, system, loop_number, description, status, system_kks, equipment_kks, commissioning_stage, test_remarks, execution_date, created_at"
             )
             .order("created_at", descending=True)
             .execute()
