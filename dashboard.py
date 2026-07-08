@@ -16,7 +16,7 @@ BUCKET_NAME = "commissioning-files"
 # =============================================================================
 # 1. STYLING
 # =============================================================================
-st.markdown(\"""
+st.markdown("""
 <style>
 .main-header {
     background: linear-gradient(120deg, #0f172a 0%, #1e3a5f 55%, #0f4c75 100%);
@@ -43,7 +43,7 @@ st.markdown(\"""
 .matrix-table td { padding: 7px 10px; border-bottom: 1px solid #eef2f7; vertical-align: middle; }
 .matrix-table tr:hover { background: #f8fafc; }
 </style>
-\""", unsafe_allow_html=True)
+""", unsafe_allow_html=True)
 
 # =============================================================================
 # 2. CONSTANTS: COMMISSIONING MILESTONES
