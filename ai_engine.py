@@ -1,9 +1,12 @@
 import json
+import io
 import requests
+import pandas as pd
+import docx  # From python-docx library
 import streamlit as st
 
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
-# Using the flagship large-context, accurate model for handling technical equipment nomenclature
+# Flagship model optimized for high-density industrial and technical nomenclature
 MODEL_NAME = "llama-3.3-70b-specdec"
 
 def ask_cloud_ai_to_parse_chunk(prompt_content: str) -> list:
@@ -22,9 +25,9 @@ def ask_cloud_ai_to_parse_chunk(prompt_content: str) -> list:
     }
 
     system_instruction = """
-    You are an expert automated systems extraction system specialized in processing nuclear power plant commissioning logs, physical loop walkdowns, KKS equipment designations, and component verification telemetry.
+    You are an expert automated data extraction system specialized in processing nuclear power plant commissioning logs, physical loop walkdowns, KKS equipment designations, spreadsheet rows, and component verification telemetry.
     
-    Analyze the raw unstructured text input logs provided by the user and transform them cleanly into a fully structured JSON array of records.
+    Analyze the raw unstructured text input logs or table rows provided by the user and transform them cleanly into a fully structured JSON array of records.
     
     Every item inside the output JSON array MUST strictly utilize these exact structural JSON keys:
     1. "tag_id": The exact technical equipment identification tag or system alphanumeric code (e.g., '10UJA-10-AA001', '0XJA-20-AP002', 'LOOP-102'). Look for pattern sequences typical of industrial or nuclear hardware tagging. If completely absent, map strictly to an empty string "".
@@ -49,8 +52,8 @@ def ask_cloud_ai_to_parse_chunk(prompt_content: str) -> list:
             {"role": "system", "content": system_instruction},
             {"role": "user", "content": prompt_content},
         ],
-        "temperature": 0.0, # Complete determinism for rigid engineering classifications
-        "response_format": {"type": "json_object"}, # Hardware level JSON validation enforcement
+        "temperature": 0.0, # Purely deterministic output
+        "response_format": {"type": "json_object"},
     }
 
     try:
@@ -60,7 +63,6 @@ def ask_cloud_ai_to_parse_chunk(prompt_content: str) -> list:
             result = response.json()
             raw_content = result["choices"][0]["message"]["content"].strip()
             
-            # Robust extraction parsing block
             try:
                 parsed_data = json.loads(raw_content)
                 if "records" in parsed_data and isinstance(parsed_data["records"], list):
@@ -69,7 +71,7 @@ def ask_cloud_ai_to_parse_chunk(prompt_content: str) -> list:
                     return parsed_data
                 elif isinstance(parsed_data, dict):
                     return [parsed_data]
-            except json.JSONDecodeError as decode_err:
+            except json.JSONDecodeError:
                 st.error(f"JSON Structure Validation Failure. Raw response preview: {raw_content[:200]}")
                 return []
         else:
@@ -78,31 +80,76 @@ def ask_cloud_ai_to_parse_chunk(prompt_content: str) -> list:
     except requests.exceptions.Timeout:
         st.error("AI Engine Error: Network connection timed out while processing text chunk.")
     except Exception as general_error:
-        st.error(f"Cloud AI engine encountered an unexpected processing pipeline exception: {str(general_error)}")
+        st.error(f"Cloud AI engine encountered an unexpected exception: {str(general_error)}")
 
     return []
 
 def universal_ai_file_parser(file_bytes: bytes, file_name: str) -> list:
     """
-    Ingests binary input document files from the dashboard, manages safe string conversion,
-    implements a rolling buffer chunking mechanism to respect LLM window contexts, and compiles results.
+    Ingests raw binary bytes from Streamlit file uploader, detects file profiles 
+    (TXT, LOG, CSV, XLSX, XLS, DOCX), translates tables/paragraphs to readable strings, 
+    and handles batch chunk transmission workflows smoothly.
     """
+    file_extension = file_name.split('.')[-1].lower()
+    raw_text = ""
+
     try:
-        raw_text = file_bytes.decode("utf-8", errors="ignore")
-    except Exception as decode_error:
-        st.error(f"Character decoding routine failed to process input binary payload: {str(decode_error)}")
+        # STRATEGY 1: Plain text file profiles
+        if file_extension in ["txt", "log", "csv"]:
+            raw_text = file_bytes.decode("utf-8", errors="ignore")
+            
+        # STRATEGY 2: Excel Spreadsheet structures
+        elif file_extension in ["xlsx", "xls"]:
+            excel_stream = io.BytesIO(file_bytes)
+            # Fetch all worksheets inside the document file
+            excel_workbook = pd.read_excel(excel_stream, sheet_name=None, dtype=str)
+            
+            text_layers = []
+            for sheet_name, dataframe in excel_workbook.items():
+                dataframe = dataframe.dropna(how='all') # Clean completely dead rows
+                if not dataframe.empty:
+                    text_layers.append(f"\n--- [EXCEL WORKSHEET: {sheet_name}] ---")
+                    # Express tables as standard comma separated values for efficient LLM processing
+                    text_layers.append(dataframe.to_csv(index=False))
+            raw_text = "\n".join(text_layers)
+
+        # STRATEGY 3: Word Document profiles
+        elif file_extension == "docx":
+            word_stream = io.BytesIO(file_bytes)
+            doc_object = docx.Document(word_stream)
+            text_layers = []
+            
+            # Step 1: Ingest text block elements
+            for paragraph in doc_object.paragraphs:
+                if paragraph.text.strip():
+                    text_layers.append(paragraph.text)
+                    
+            # Step 2: Extract nested matrix tables embedded in document structures
+            for table in doc_object.tables:
+                text_layers.append("\n[EMBEDDED TABLE CONTEXT]")
+                for row in table.rows:
+                    row_cells = [cell.text.strip() for cell in row.cells if cell.text.strip()]
+                    if row_cells:
+                        text_layers.append(" | ".join(row_cells))
+                        
+            raw_text = "\n".join(text_layers)
+            
+        else:
+            st.error(f"Unsupported file format extension profile detected: .{file_extension}")
+            return []
+
+    except Exception as parsing_exception:
+        st.error(f"Core Data Extraction framework failed compiling file contents: {str(parsing_exception)}")
         return []
 
     clean_text = raw_text.strip()
     if not clean_text:
-        st.warning(f"Aborted file processing execution: '{file_name}' appears to contain no text characters.")
+        st.warning(f"Aborted execution: '{file_name}' did not yield any valid text strings.")
         return []
 
-    # Safe chunk sizing bounds (roughly 15,000 to 20,000 words to safeguard API window ceilings)
+    # Stream batch chunks safely into context windows
     max_chunk_size = 65000
     all_extracted_records = []
-
-    # Calculate total processing load for UI readability
     total_chars = len(clean_text)
     total_chunks = (total_chars // max_chunk_size) + (1 if total_chars % max_chunk_size > 0 else 0)
 
@@ -111,7 +158,7 @@ def universal_ai_file_parser(file_bytes: bytes, file_name: str) -> list:
         end_pos = min(start_pos + max_chunk_size, total_chars)
         text_chunk = clean_text[start_pos:end_pos]
         
-        with st.spinner(f"AI Core processing document chunk batch {chunk_index + 1} of {total_chunks}..."):
+        with st.spinner(f"AI engine evaluating processing layer {chunk_index + 1} of {total_chunks}..."):
             extracted_chunk = ask_cloud_ai_to_parse_chunk(text_chunk)
             if extracted_chunk:
                 all_extracted_records.extend(extracted_chunk)
