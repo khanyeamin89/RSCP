@@ -1,125 +1,78 @@
 import streamlit as st
 from config import get_supabase_client
 
+
 def insert_records_to_supabase(records_list: list) -> bool:
-    """
-    Ingests an array of structured dictionary records and performs a bulk insert 
+    """Ingests an array of structured dictionary records and performs a bulk insert
+
     transaction into the target Supabase relational table ('rscp_logs').
-    Includes transactional error tracking and validation.
     """
     if not records_list:
-        st.warning("Database layer execution bypassed: Ingested record array is empty.")
+        st.warning(
+            "Database layer execution bypassed: Ingested record array is empty."
+        )
         return False
 
     supabase = get_supabase_client()
-    
-    # Sanitize and validate basic schema constraints before transmission
+
     sanitized_records = []
     required_keys = {"tag_id", "system", "loop_number", "description", "status"}
-    
+
     for idx, record in enumerate(records_list):
         if not isinstance(record, dict):
             continue
-        # Ensure all structural fields exist, filling missing ones with logical defaults
         clean_record = {key: record.get(key, "") for key in required_keys}
         if not clean_record["system"]:
             clean_record["system"] = "General"
-        if clean_record["status"] not in ["Pending", "In Progress", "Verified", "Failed"]:
+        if clean_record["status"] not in [
+            "Pending",
+            "In Progress",
+            "Verified",
+            "Failed",
+        ]:
             clean_record["status"] = "Pending"
-            
+
         sanitized_records.append(clean_record)
 
     try:
-        response = supabase.table("rscp_logs").insert(sanitized_records).execute()
-        # Verify execution context by tracking returned data blocks
-        if hasattr(response, 'data') and response.data:
+        response = (
+            supabase.table("rscp_logs").insert(sanitized_records).execute()
+        )
+        if hasattr(response, "data") and response.data:
             return True
         else:
-            st.error("Database Transaction Failure: Operation completed but no confirmation rows were generated.")
+            st.error(
+                "Database Transaction Failure: Operation completed but no confirmation rows were generated."
+            )
             return False
-            
+
     except Exception as db_transaction_error:
-        st.error(f"Critical Database Write Exception Raised: {str(db_transaction_error)}")
+        st.error(
+            f"Critical Database Write Exception Raised: {str(db_transaction_error)}"
+        )
         return False
 
+
 def fetch_all_records_from_supabase() -> list:
-    """
-    Queries the master 'rscp_logs' relational table, retrieving the full 
-    historical sequence of logged entries sorted chronologically by creation timestamp.
+    """Queries the master 'rscp_logs' relational table, retrieving the full
+
+    historical sequence of logged entries sorted chronologically.
     """
     supabase = get_supabase_client()
     try:
         response = (
             supabase.table("rscp_logs")
-            .select("id, tag_id, system, loop_number, description, status, created_at")
+            .select(
+                "id, tag_id, system, loop_number, description, status, created_at"
+            )
             .order("created_at", descending=True)
             .execute()
         )
-        if hasattr(response, 'data'):
+        if hasattr(response, "data"):
             return response.data
         return []
     except Exception as db_query_error:
-        st.error(f"Critical Database Read Exception Raised: {str(db_query_error)}")
-        return []import streamlit as st
-from config import get_supabase_client
-
-def insert_records_to_supabase(records_list: list) -> bool:
-    """
-    Ingests an array of structured dictionary records and performs a bulk insert 
-    transaction into the target Supabase relational table ('rscp_logs').
-    Includes transactional error tracking and validation.
-    """
-    if not records_list:
-        st.warning("Database layer execution bypassed: Ingested record array is empty.")
-        return False
-
-    supabase = get_supabase_client()
-    
-    # Sanitize and validate basic schema constraints before transmission
-    sanitized_records = []
-    required_keys = {"tag_id", "system", "loop_number", "description", "status"}
-    
-    for idx, record in enumerate(records_list):
-        if not isinstance(record, dict):
-            continue
-        # Ensure all structural fields exist, filling missing ones with logical defaults
-        clean_record = {key: record.get(key, "") for key in required_keys}
-        if not clean_record["system"]:
-            clean_record["system"] = "General"
-        if clean_record["status"] not in ["Pending", "In Progress", "Verified", "Failed"]:
-            clean_record["status"] = "Pending"
-            
-        sanitized_records.append(clean_record)
-
-    try:
-        response = supabase.table("rscp_logs").insert(sanitized_records).execute()
-        # Verify execution context by tracking returned data blocks
-        if hasattr(response, 'data') and response.data:
-            return True
-        else:
-            st.error("Database Transaction Failure: Operation completed but no confirmation rows were generated.")
-            return False
-            
-    except Exception as db_transaction_error:
-        st.error(f"Critical Database Write Exception Raised: {str(db_transaction_error)}")
-        return False
-
-def fetch_all_records_from_supabase() -> list:
-    """
-    Queries the master 'rscp_logs' relational table, retrieving the full 
-    historical sequence of logged entries sorted chronologically by creation timestamp.
-    """
-    supabase = get_supabase_client()
-    try:
-        response = (
-            supabase.table("rscp_logs")
-            .select("id, tag_id, system, loop_number, description, status, created_at")
-            .order("created_at", descending=True)
-            .execute()
+        st.error(
+            f"Critical Database Read Exception Raised: {str(db_query_error)}"
         )
-        if hasattr(response, 'data'):
-            return response.data
-        return []
-    except Exception as db_query_error:
-        st.error(f"Critical Database Read Exception Raised: {str(db_query_error)}")
         return []
