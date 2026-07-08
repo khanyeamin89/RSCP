@@ -159,7 +159,7 @@ def universal_ai_file_parser(file_bytes: bytes, file_name: str) -> list:
         )
         return []
 
-    max_chunk_size = 65000
+    max_chunk_size = 35000
     all_extracted_records = []
     total_chars = len(clean_text)
     total_chunks = (total_chars // max_chunk_size) + (
