@@ -1,188 +1,347 @@
 """
-Reactor Shop Commissioning - Database Operations
-=================================================
-All Supabase interactions with validation, error handling, and transaction safety.
+Reactor Shop Commissioning - AI Processing Engine
+==================================================
+Natural language parsing, KKS classification, and intelligent data extraction.
 """
 
+import json
+import hashlib
 import streamlit as st
-from typing import Dict, List, Optional, Any, Tuple
-from postgrest.exceptions import APIError
+import pandas as pd
+from io import BytesIO
+from typing import Dict, List, Any, Tuple, Optional
 
-# Import from centralized config
+from database import upsert_registry_row, check_chunk_exists, mark_chunk_done
 from config import (
-    get_supabase_client,
-    validate_record,
+    get_kks_scope,
     enforce_scope_milestones,
     validate_milestone_dependencies,
-    REGISTRY_SCHEMA,
-    REGISTRY_UNIQUE_KEYS,
+    ScopeType,
+    SYSTEM_PREFIXES,
+    EQUIPMENT_PREFIXES,
     MILESTONES,
+    VALID_STATUSES,
 )
 
 
 # =============================================================================
-# REGISTRY OPERATIONS
+# GROQ API INTEGRATION
 # =============================================================================
 
-def load_registry() -> List[Dict[str, Any]]:
+def ask_groq(prompt: str, max_retries: int = 2) -> Optional[Dict[str, Any]]:
     """
-    Loads all records from the registry table.
-    Returns empty list on error (with UI notification).
-    """
-    try:
-        supabase = get_supabase_client()
-        response = supabase.table("registry").select("*").execute()
-        return response.data if response.data else []
-    except APIError as e:
-        st.error(f"Database Error loading registry: {e.message}")
-        return []
-    except Exception as e:
-        st.error(f"Unexpected error loading registry: {str(e)}")
-        return []
-
-
-def load_registry_df() -> "pd.DataFrame":
-    """Loads registry as a pandas DataFrame for analytics."""
-    import pandas as pd
-    data = load_registry()
-    if not data:
-        return pd.DataFrame(columns=list(REGISTRY_SCHEMA.keys()))
-    return pd.DataFrame(data)
-
-
-def upsert_registry_row(row: Dict[str, Any], skip_validation: bool = False) -> Tuple[bool, List[str]]:
-    """
-    Upserts a single row into the registry table.
+    Groq API wrapper with JSON enforcement, retry logic, and error handling.
 
     Args:
-        row: The record dictionary to upsert
-        skip_validation: If True, bypasses validation (use with caution)
+        prompt: The text to send to the LLM
+        max_retries: Number of retry attempts on failure
 
     Returns:
-        (success: bool, messages: list of info/warning/error strings)
+        Parsed JSON dict or None on failure
     """
-    messages = []
+    import requests
+    import time
 
-    # --- Step 1: Validate record structure ---
-    if not skip_validation:
-        is_valid, issues = validate_record(row)
-        if not is_valid:
-            for issue in issues:
-                messages.append(f"VALIDATION ERROR: {issue}")
-            st.error("Record validation failed. See details below.")
-            for msg in messages:
-                st.markdown(f'<div class="alert-box alert-error">{msg}</div>', unsafe_allow_html=True)
-            return False, messages
-
-    # --- Step 2: Enforce scope-based milestone rules ---
-    row, scope_alerts = enforce_scope_milestones(row)
-    messages.extend(scope_alerts)
-
-    # --- Step 3: Check milestone dependencies ---
-    dep_violations = validate_milestone_dependencies(row)
-    if dep_violations:
-        for v in dep_violations:
-            messages.append(f"DEPENDENCY: {v}")
-        st.warning("Milestone dependency warnings detected. Record will be saved, but review required.")
-        for v in dep_violations:
-            st.markdown(f'<div class="alert-box alert-warning">{v}</div>', unsafe_allow_html=True)
-
-    # --- Step 4: Ensure all schema fields exist (fill missing with defaults) ---
-    clean_row = {}
-    for field, field_type in REGISTRY_SCHEMA.items():
-        val = row.get(field)
-        if val is None:
-            if field_type == str:
-                clean_row[field] = ""
-            else:
-                clean_row[field] = None
-        else:
-            clean_row[field] = str(val) if field_type == str else val
-
-    # --- Step 5: Execute upsert ---
-    try:
-        supabase = get_supabase_client()
-        result = supabase.table("registry").upsert(
-            clean_row, 
-            on_conflict=",".join(REGISTRY_UNIQUE_KEYS)
-        ).execute()
-
-        messages.append(f"SUCCESS: Record upserted for '{row.get('system', 'Unknown')}' / '{row.get('component', 'Unknown')}'")
-        return True, messages
-
-    except APIError as e:
-        err_msg = f"Database upsert failed: {e.message}"
-        messages.append(f"ERROR: {err_msg}")
-        st.error(err_msg)
-        return False, messages
-    except Exception as e:
-        err_msg = f"Unexpected error during upsert: {str(e)}"
-        messages.append(f"ERROR: {err_msg}")
-        st.error(err_msg)
-        return False, messages
-
-
-def get_registry_row(system: str, component: str) -> Optional[Dict[str, Any]]:
-    """Fetches a single record by system + component composite key."""
-    try:
-        supabase = get_supabase_client()
-        result = supabase.table("registry")            .select("*")            .eq("system", system)            .eq("component", component)            .execute()
-        return result.data[0] if result.data else None
-    except Exception as e:
-        st.error(f"Error fetching record: {str(e)}")
+    api_key = st.secrets.get("GROQ_API_KEY")
+    if not api_key:
+        st.error("GROQ_API_KEY not found in Streamlit secrets.")
         return None
 
+    system_prompt = """You are a nuclear commissioning data extraction expert.
 
-# =============================================================================
-# CHUNK TRACKING (Idempotent Processing)
-# =============================================================================
+    Extract commissioning registry data from the provided shift notes into valid JSON.
 
-def check_chunk_exists(file_hash: str, chunk_index: int) -> bool:
-    """Checks if a file chunk has already been processed."""
-    try:
-        supabase = get_supabase_client()
-        res = supabase.table("processed_chunks")            .select("id", count="exact")            .eq("file_hash", file_hash)            .eq("chunk_index", chunk_index)            .execute()
-        return res.count > 0 if hasattr(res, 'count') else len(res.data) > 0
-    except Exception as e:
-        st.warning(f"Chunk check failed (assuming not processed): {str(e)}")
-        return False
+    OUTPUT FORMAT:
+    {
+        "records": [
+            {
+                "system": "System Name",
+                "system_kks": "KKS Code",
+                "scope_type": "System|Equipment",
+                "component": "Component Tag",
+                "it_status": "Pending|In Progress|Completed|Failed|N/A",
+                "pic_status": "Pending|In Progress|Completed|Failed|N/A",
+                "ht_status": "Pending|In Progress|Completed|Failed|N/A",
+                "pt_status": "Pending|In Progress|Completed|Failed|N/A",
+                "saw_status": "Pending|In Progress|Completed|Failed|N/A",
+                "comments": "Any relevant notes"
+            }
+        ]
+    }
 
-
-def mark_chunk_done(file_hash: str, chunk_index: int) -> bool:
-    """Marks a file chunk as successfully processed."""
-    try:
-        supabase = get_supabase_client()
-        supabase.table("processed_chunks").insert({
-            "file_hash": file_hash,
-            "chunk_index": chunk_index
-        }).execute()
-        return True
-    except Exception as e:
-        st.warning(f"Failed to mark chunk {chunk_index} as done: {str(e)}")
-        return False
-
-
-# =============================================================================
-# BATCH OPERATIONS
-# =============================================================================
-
-def upsert_registry_batch(records: List[Dict[str, Any]]) -> Tuple[int, List[str]]:
+    RULES:
+    1. Identify KKS codes first. System KKS = 3-letter prefix (JEA, JAA, etc.). Equipment KKS = 2-letter prefix (AA, AP, etc.).
+    2. If scope cannot be determined from KKS, infer from context ("system" vs "equipment").
+    3. Status keywords: "done", "complete", "finished", "passed" → "Completed"
+    4. Status keywords: "ongoing", "in progress", "started" → "In Progress"
+    5. Status keywords: "failed", "rejected", "issue" → "Failed"
+    6. Status keywords: "pending", "not started", "awaiting" → "Pending"
+    7. If a milestone is not mentioned, default to "Pending".
+    8. For Equipment scope, PT and SAW should be "N/A".
+    9. PIC (Post Installation Cleaning) must precede HT (Hydro Test).
+    10. Include any anomalies or special notes in "comments".
     """
-    Batch upsert with per-record validation and scope enforcement.
-    Returns (success_count, list of all messages).
+
+    payload = {
+        "model": "llama-3.3-70b-versatile",
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": prompt}
+        ],
+        "response_format": {"type": "json_object"},
+        "temperature": 0.1,  # Low temperature for deterministic extraction
+        "max_tokens": 4000
+    }
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json"
+    }
+
+    for attempt in range(max_retries + 1):
+        try:
+            response = requests.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                json=payload,
+                headers=headers,
+                timeout=60
+            )
+            response.raise_for_status()
+
+            result = response.json()
+            content = result['choices'][0]['message']['content']
+            parsed = json.loads(content)
+            return parsed
+
+        except requests.exceptions.HTTPError as e:
+            if response.status_code == 429 and attempt < max_retries:
+                wait_time = 2 ** attempt
+                st.warning(f"Rate limited. Retrying in {wait_time}s...")
+                time.sleep(wait_time)
+                continue
+            st.error(f"Groq API HTTP Error ({response.status_code}): {str(e)}")
+            return None
+        except json.JSONDecodeError as e:
+            st.error(f"Groq returned invalid JSON: {str(e)}")
+            return None
+        except Exception as e:
+            st.error(f"Groq API call failed: {str(e)}")
+            return None
+
+    return None
+
+
+# =============================================================================
+# FILE PARSING
+# =============================================================================
+
+def extract_text_from_file(file_bytes: bytes, file_name: str) -> str:
     """
-    success_count = 0
-    all_messages = []
+    Extracts text content from CSV, XLSX, or plain text files.
+    """
+    file_lower = file_name.lower()
 
-    progress = st.progress(0)
-    total = len(records)
+    if file_lower.endswith('.csv'):
+        try:
+            df = pd.read_csv(BytesIO(file_bytes))
+            return df.to_string(index=False)
+        except Exception as e:
+            # Fallback: try as plain text
+            return file_bytes.decode('utf-8', errors='ignore')
 
-    for i, record in enumerate(records):
-        ok, msgs = upsert_registry_row(record)
-        all_messages.extend(msgs)
-        if ok:
-            success_count += 1
-        progress.progress((i + 1) / total)
+    elif file_lower.endswith('.xlsx') or file_lower.endswith('.xls'):
+        try:
+            df = pd.read_excel(BytesIO(file_bytes))
+            return df.to_string(index=False)
+        except Exception as e:
+            st.error(f"Failed to parse Excel file: {str(e)}")
+            return ""
 
-    progress.empty()
-    return success_count, all_messages
+    else:
+        # Plain text
+        return file_bytes.decode('utf-8', errors='ignore')
+
+
+def smart_chunk_text(text: str, max_chunk_size: int = 15000) -> List[str]:
+    """
+    Chunks text intelligently by trying to preserve record boundaries.
+    Falls back to character-based chunking if no clear boundaries found.
+    """
+    # Try to split by double newlines (common record separator)
+    records = text.split('\n\n')
+
+    chunks = []
+    current_chunk = ""
+
+    for record in records:
+        if len(current_chunk) + len(record) + 2 > max_chunk_size:
+            if current_chunk:
+                chunks.append(current_chunk.strip())
+            current_chunk = record
+        else:
+            current_chunk += "\n\n" + record if current_chunk else record
+
+    if current_chunk:
+        chunks.append(current_chunk.strip())
+
+    # If any chunk is still too large, force split by single newlines
+    final_chunks = []
+    for chunk in chunks:
+        if len(chunk) > max_chunk_size:
+            lines = chunk.split('\n')
+            current = ""
+            for line in lines:
+                if len(current) + len(line) + 1 > max_chunk_size:
+                    final_chunks.append(current.strip())
+                    current = line
+                else:
+                    current += "\n" + line if current else line
+            if current:
+                final_chunks.append(current.strip())
+        else:
+            final_chunks.append(chunk)
+
+    return final_chunks if final_chunks else [text[:max_chunk_size]]
+
+
+# =============================================================================
+# MAIN PROCESSING PIPELINE
+# =============================================================================
+
+def process_file_smart(file_bytes: bytes, file_name: str) -> Tuple[int, List[str]]:
+    """
+    Incremental, idempotent file processing pipeline.
+
+    Args:
+        file_bytes: Raw file bytes
+        file_name: Original filename
+
+    Returns:
+        (records_processed, list of all alert messages)
+    """
+    all_alerts = []
+    total_processed = 0
+
+    # Compute file hash for idempotency
+    file_hash = hashlib.md5(file_bytes).hexdigest()
+
+    # Extract text
+    raw_text = extract_text_from_file(file_bytes, file_name)
+    if not raw_text.strip():
+        st.error("Could not extract any text from the uploaded file.")
+        return 0, ["ERROR: Empty or unreadable file"]
+
+    # Smart chunking
+    chunks = smart_chunk_text(raw_text)
+    st.info(f"File split into {len(chunks)} chunk(s) for processing.")
+
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+
+    for i, chunk in enumerate(chunks):
+        status_text.text(f"Processing chunk {i+1}/{len(chunks)}...")
+
+        # Skip already processed chunks
+        if check_chunk_exists(file_hash, i):
+            st.info(f"Chunk {i+1} already processed (skipping).")
+            progress_bar.progress((i + 1) / len(chunks))
+            continue
+
+        # Call AI extraction
+        data = ask_groq(chunk)
+        if data is None:
+            all_alerts.append(f"ERROR: Failed to process chunk {i+1}")
+            progress_bar.progress((i + 1) / len(chunks))
+            continue
+
+        # Extract records (handle both {records: [...]} and direct dict formats)
+        records = data.get("records", [])
+        if not records and all(k in data for k in ['system', 'system_kks', 'component']):
+            records = [data]
+
+        st.info(f"Chunk {i+1}: Extracted {len(records)} record(s).")
+
+        # Process each record
+        for record in records:
+            # Ensure KKS scope is correct
+            kks = record.get('system_kks', '')
+            scope = get_kks_scope(kks)
+
+            if scope:
+                record['scope_type'] = scope.value
+
+            # Enforce scope milestones and collect alerts
+            record, scope_alerts = enforce_scope_milestones(record)
+            all_alerts.extend(scope_alerts)
+
+            # Check for N/A milestone violations in the source text
+            if scope == ScopeType.EQUIPMENT:
+                for ms in ['pt_status', 'saw_status']:
+                    src_val = record.get(ms, '')
+                    if src_val not in ('N/A', 'Not Applicable', '', 'Pending'):
+                        all_alerts.append(
+                            f"ALERT: Source text requested action on '{ms}' for Equipment KKS '{kks}', "
+                            f"but this milestone is N/A for Equipment scope. Value corrected to 'N/A'."
+                        )
+
+            # Validate dependencies
+            dep_issues = validate_milestone_dependencies(record)
+            all_alerts.extend(dep_issues)
+
+            # Upsert to database
+            ok, msgs = upsert_registry_row(record)
+            all_alerts.extend(msgs)
+            if ok:
+                total_processed += 1
+
+        # Mark chunk as done
+        mark_chunk_done(file_hash, i)
+        progress_bar.progress((i + 1) / len(chunks))
+
+    progress_bar.empty()
+    status_text.empty()
+
+    return total_processed, all_alerts
+
+
+# =============================================================================
+# NATURAL LANGUAGE SHIFT NOTE PARSER (Direct API)
+# =============================================================================
+
+def parse_shift_notes(notes_text: str) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """
+    Parses natural language shift notes directly into structured records.
+
+    Returns:
+        (list of parsed records, list of alerts/warnings)
+    """
+    if not notes_text or not notes_text.strip():
+        return [], ["ERROR: Empty shift notes provided"]
+
+    data = ask_groq(notes_text)
+    if data is None:
+        return [], ["ERROR: AI extraction failed"]
+
+    records = data.get("records", [])
+    if not records and all(k in data for k in ['system', 'system_kks', 'component']):
+        records = [data]
+
+    alerts = []
+    validated_records = []
+
+    for record in records:
+        kks = record.get('system_kks', '')
+        scope = get_kks_scope(kks)
+
+        if scope is None:
+            alerts.append(f"WARNING: Unrecognized KKS '{kks}' in extracted record. Manual review required.")
+        else:
+            record['scope_type'] = scope.value
+            record, scope_alerts = enforce_scope_milestones(record)
+            alerts.extend(scope_alerts)
+
+        dep_issues = validate_milestone_dependencies(record)
+        alerts.extend(dep_issues)
+        validated_records.append(record)
+
+    return validated_records, alerts
