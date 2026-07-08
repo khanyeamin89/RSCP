@@ -1,176 +1,52 @@
-import io
-import json
-import requests
-import docx
-import pandas as pd
-import streamlit as st
+import json, requests, hashlib, streamlit as st
+from database import upsert_registry_row, check_chunk_exists, mark_chunk_done
 
-GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
-MODEL_NAME = "llama-3.3-70b-versatile"
-
-
-def ask_cloud_ai_to_parse_chunk(prompt_content: str) -> list:
-    """Dispatches logs to the Groq API to extract specialized nuclear commissioning parameters."""
-    api_key = st.secrets.get("GROQ_API_KEY")
-    if not api_key:
-        st.error("AI Engine Aborted: 'GROQ_API_KEY' is missing.")
-        return []
-
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
-
-    system_instruction = """
-    You are an expert automated systems extraction assistant specialized in nuclear power plant commissioning analytics, KKS (Kraftwerk-Kennzeichensystem) parsing formats, and loop testing protocols.
+def get_kks_scope(kks_code):
+    """Advanced KKS Mapping Engine"""
+    kks_code = str(kks_code).upper()
+    system_prefixes = ('JEA', 'JAA', 'JEB', 'JAB')
+    equipment_prefixes = ('AA', 'AP', 'AH', 'AT', 'AN')
     
-    Analyze the raw input text logs, spreadsheet rows, or document sections and convert them cleanly into a structured JSON array of records.
-    
-    Each record inside the JSON array MUST strictly utilize these exact JSON keys:
-    1. "tag_id": General loop code, milestone tag, or reference string if explicitly labeled. If absent, map to "".
-    2. "system": The parent physical unit loop designation (e.g., 'Primary Circuit', 'Ventilation System'). Default to 'General' if unclear.
-    3. "loop_number": The index identifier string or circuit line index. Map to "" if missing.
-    4. "description": A highly focused, professionally written engineering summary of the operational work executed.
-    5. "status": Strictly evaluate the text context and map to one of these four string validation parameters: "Pending", "In Progress", "Verified", or "Failed".
-    6. "system_kks": The parent system KKS alphanumeric string (e.g., '10UJA', '10YCB', '0XJA'). If missing, map to "".
-    7. "equipment_kks": The exact components KKS alphanumeric identifier code (e.g., '10UJA10AA001', '0XJA20AP002'). If missing, map to "".
-    8. "commissioning_stage": Identify the active phase or milestone (e.g., 'Phase A - Pre-operational checks', 'Phase B - Hydrostatic Testing', 'Hot Functional Test', 'Pre-commissioning flush').
-    9. "test_remarks": Specific diagnostic telemetry values, measurements (e.g., '24.5 MPa', 'vibrations balanced'), or specific observations recorded during the work.
-    10. "execution_date": Look for calendar execution timestamps within the log text. Extract and format strictly as an ISO standard date string 'YYYY-MM-DD'. If no concrete date is found inside the text, return an empty string "".
+    if kks_code.startswith(system_prefixes): return "System"
+    if kks_code.startswith(equipment_prefixes): return "Equipment"
+    return "Equipment" 
 
-    CRITICAL COMPLIANCE RULES:
-    - Output ONLY a valid JSON object containing a root key named "records" whose value is a list of these objects.
-    - Example: { "records": [ { "tag_id": "LOOP-101", "system": "UJA System", "loop_number": "1", "description": "Pre-operational visual inspection finalized on the main circuit lines.", "status": "Verified", "system_kks": "10UJA", "equipment_kks": "10UJA10AA001", "commissioning_stage": "Phase A - Pre-operational", "test_remarks": "No cracks detected, welds authenticated.", "execution_date": "2026-07-08" } ] }
-    - Do not inject markdown block wraps (e.g. ```json), notes, or conversational text. Returning anything other than raw, compilable JSON will crash the app.
-    """
-
+def ask_groq(prompt):
+    """Groq API wrapper with JSON enforcement"""
+    api_key = st.secrets["GROQ_API_KEY"]
     payload = {
-        "model": MODEL_NAME,
+        "model": "llama-3.3-70b-versatile",
         "messages": [
-            {"role": "system", "content": system_instruction},
-            {"role": "user", "content": prompt_content},
+            {"role": "system", "content": "You are a commissioning expert. Extract data to JSON format with keys: system, system_kks, scope_type, component, it_status, pic_status, ht_status, pt_status, saw_status, comments."},
+            {"role": "user", "content": prompt}
         ],
-        "temperature": 0.0,
-        "response_format": {"type": "json_object"},
+        "response_format": {"type": "json_object"}
     }
+    response = requests.post("https://api.groq.com/openai/v1/chat/completions", 
+                             json=payload, headers={"Authorization": f"Bearer {api_key}"})
+    return json.loads(response.json()['choices'][0]['message']['content'])
 
-    try:
-        response = requests.post(
-            GROQ_API_URL, json=payload, headers=headers, timeout=45
-        )
-
-        if response.status_code == 200:
-            result = response.json()
-            raw_content = result["choices"][0]["message"]["content"].strip()
-
-            try:
-                parsed_data = json.loads(raw_content)
-                if "records" in parsed_data and isinstance(
-                    parsed_data["records"], list
-                ):
-                    return parsed_data["records"]
-                elif isinstance(parsed_data, list):
-                    return parsed_data
-                elif isinstance(parsed_data, dict):
-                    return [parsed_data]
-            except json.JSONDecodeError:
-                st.error(
-                    f"JSON Structure Validation Failure. Raw response preview: {raw_content[:200]}"
-                )
-                return []
-        else:
-            st.error(
-                f"Groq API Cloud Node Rejected Request: Code {response.status_code} - {response.text}"
-            )
-
-    except requests.exceptions.Timeout:
-        st.error("AI Engine Error: Network connection timed out.")
-    except Exception as general_error:
-        st.error(
-            f"Cloud AI engine encountered an unexpected exception: {str(general_error)}"
-        )
-
-    return []
-
-
-def universal_ai_file_parser(file_bytes: bytes, file_name: str) -> list:
-    """Ingests multi-format documents (TXT, LOG, CSV, XLSX, XLS, DOCX) and streams them through the chunking pipeline."""
-    file_extension = file_name.split(".")[-1].lower()
-    raw_text = ""
-
-    try:
-        if file_extension in ["txt", "log", "csv"]:
-            raw_text = file_bytes.decode("utf-8", errors="ignore")
-
-        elif file_extension in ["xlsx", "xls"]:
-            excel_stream = io.BytesIO(file_bytes)
-            excel_workbook = pd.read_excel(
-                excel_stream, sheet_name=None, dtype=str
-            )
-
-            text_layers = []
-            for sheet_name, dataframe in excel_workbook.items():
-                dataframe = dataframe.dropna(how="all")
-                if not dataframe.empty:
-                    text_layers.append(
-                        f"\n--- [EXCEL WORKSHEET: {sheet_name}] ---"
-                    )
-                    text_layers.append(dataframe.to_csv(index=False))
-            raw_text = "\n".join(text_layers)
-
-        elif file_extension == "docx":
-            word_stream = io.BytesIO(file_bytes)
-            doc_object = docx.Document(word_stream)
-            text_layers = []
-
-            for paragraph in doc_object.paragraphs:
-                if paragraph.text.strip():
-                    text_layers.append(paragraph.text)
-
-            for table in doc_object.tables:
-                text_layers.append("\n[EMBEDDED TABLE CONTEXT]")
-                for row in table.rows:
-                    row_cells = [
-                        cell.text.strip()
-                        for cell in row.cells
-                        if cell.text.strip()
-                    ]
-                    if row_cells:
-                        text_layers.append(" | ".join(row_cells))
-
-            raw_text = "\n".join(text_layers)
-
-        else:
-            st.error(
-                f"Unsupported file format extension profile detected: .{file_extension}"
-            )
-            return []
-
-    except Exception as parsing_exception:
-        st.error(
-            f"Core Data Extraction framework failed compiling file contents: {str(parsing_exception)}"
-        )
-        return []
-
-    clean_text = raw_text.strip()
-    if not clean_text:
-        st.warning(
-            f"Aborted execution: '{file_name}' did not yield any valid text strings."
-        )
-        return []
-
-    max_chunk_size = 35000 
-    all_records = []
-    total_chars = len(raw_text)
-    total_chunks = (total_chars // max_chunk_size) + 1
-
-    for i in range(total_chunks):
-        chunk = raw_text[i * max_chunk_size : (i + 1) * max_chunk_size]
-        if not chunk.strip(): continue
+def process_file_smart(file_bytes, file_name):
+    """Incremental Processing Engine"""
+    file_hash = hashlib.md5(file_bytes).hexdigest()
+    # Simple chunking logic (splitting by newline for text or row-count for CSV)
+    raw_text = file_bytes.decode('utf-8', errors='ignore')
+    chunks = [raw_text[i:i+30000] for i in range(0, len(raw_text), 30000)]
+    
+    for i, chunk in enumerate(chunks):
+        if check_chunk_exists(file_hash, i): continue
         
-        with st.spinner(f"Processing layer {i+1}/{total_chunks}..."):
-            records = ask_cloud_ai_to_parse_chunk(chunk)
-            if records:
-                all_records.extend(records)
-
-    return all_records
+        data = ask_groq(chunk)
+        records = data.get("records", []) if "records" in data else [data]
+        
+        for record in records:
+            # Apply KKS-based Milestone logic
+            scope = get_kks_scope(record.get('system_kks', ''))
+            record['scope_type'] = scope
+            if scope == 'Equipment':
+                record['pt_status'] = 'N/A'
+                record['saw_status'] = 'N/A'
+            
+            upsert_registry_row(record)
+        
+        mark_chunk_done(file_hash, i)
