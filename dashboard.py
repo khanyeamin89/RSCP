@@ -2,12 +2,11 @@
 Reactor Shop Commissioning - Main Dashboard
 ============================================
 Interactive Streamlit application for commissioning registry management.
+Uses native Streamlit charts to avoid external dependencies.
 """
 
 import streamlit as st
 import pandas as pd
-import plotly.express as px
-import plotly.graph_objects as go
 from typing import Dict, Any, List
 
 # Import centralized config and database modules
@@ -112,55 +111,48 @@ with tab1:
         with col_left:
             st.subheader("Milestone Status Distribution")
             if 'it_status' in df.columns:
-                # Melt the dataframe for milestone comparison
-                melt_data = []
-                for _, row in df.iterrows():
-                    scope = row.get('scope_type', 'Unknown')
-                    for ms in MILESTONES:
-                        val = str(row.get(ms, 'N/A')).strip() or 'N/A'
-                        # Skip N/A milestones for equipment in chart
-                        if scope == 'Equipment' and ms in ('pt_status', 'saw_status'):
-                            continue
-                        melt_data.append({
-                            'Milestone': ms.replace('_status', '').upper(),
-                            'Status': val,
-                            'Scope': scope
-                        })
+                # Build a summary dataframe for the bar chart
+                status_summary = {ms.replace('_status', '').upper(): {} for ms in MILESTONES}
 
-                if melt_data:
-                    melt_df = pd.DataFrame(melt_data)
-                    fig = px.histogram(
-                        melt_df, 
-                        x="Milestone", 
-                        color="Status",
-                        barmode="group",
-                        title="Status Distribution by Milestone",
-                        color_discrete_map={
-                            'Completed': '#22c55e',
-                            'In Progress': '#eab308',
-                            'Pending': '#94a3b8',
-                            'Failed': '#ef4444',
-                            'N/A': '#cbd5e1'
-                        }
-                    )
-                    fig.update_layout(height=400)
-                    st.plotly_chart(fig, use_container_width=True)
+                for ms in MILESTONES:
+                    ms_label = ms.replace('_status', '').upper()
+                    for status in ['Completed', 'In Progress', 'Pending', 'Failed', 'N/A']:
+                        count = 0
+                        for _, row in df.iterrows():
+                            scope = row.get('scope_type', '')
+                            if scope == 'Equipment' and ms in ('pt_status', 'saw_status'):
+                                continue
+                            if str(row.get(ms, '')).strip() == status:
+                                count += 1
+                        if count > 0:
+                            status_summary[ms_label][status] = count
+
+                # Convert to DataFrame for st.bar_chart
+                chart_data = []
+                for ms_label, statuses in status_summary.items():
+                    for status, count in statuses.items():
+                        chart_data.append({'Milestone': ms_label, 'Status': status, 'Count': count})
+
+                if chart_data:
+                    chart_df = pd.DataFrame(chart_data)
+                    pivot_df = chart_df.pivot(index='Milestone', columns='Status', values='Count').fillna(0)
+                    # Reorder columns for consistent colors
+                    col_order = ['Completed', 'In Progress', 'Pending', 'Failed', 'N/A']
+                    pivot_df = pivot_df[[c for c in col_order if c in pivot_df.columns]]
+                    st.bar_chart(pivot_df, use_container_width=True, height=400)
+                else:
+                    st.info("No milestone data to display.")
 
         with col_right:
             st.subheader("Scope Breakdown")
             if 'scope_type' in df.columns:
                 scope_counts = df['scope_type'].value_counts().reset_index()
                 scope_counts.columns = ['Scope', 'Count']
-                fig2 = px.pie(
-                    scope_counts, 
-                    values='Count', 
-                    names='Scope',
-                    title="Records by Scope Type",
-                    color='Scope',
-                    color_discrete_map={'System': '#3b82f6', 'Equipment': '#f59e0b'}
+                st.bar_chart(
+                    scope_counts.set_index('Scope'),
+                    use_container_width=True,
+                    height=400
                 )
-                fig2.update_layout(height=400)
-                st.plotly_chart(fig2, use_container_width=True)
 
         st.markdown("---")
 
