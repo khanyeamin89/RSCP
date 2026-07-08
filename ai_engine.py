@@ -159,23 +159,18 @@ def universal_ai_file_parser(file_bytes: bytes, file_name: str) -> list:
         )
         return []
 
-    max_chunk_size = 35000
-    all_extracted_records = []
-    total_chars = len(clean_text)
-    total_chunks = (total_chars // max_chunk_size) + (
-        1 if total_chars % max_chunk_size > 0 else 0
-    )
+    max_chunk_size = 35000 
+    all_records = []
+    total_chars = len(raw_text)
+    total_chunks = (total_chars // max_chunk_size) + 1
 
-    for chunk_index in range(total_chunks):
-        start_pos = chunk_index * max_chunk_size
-        end_pos = min(start_pos + max_chunk_size, total_chars)
-        text_chunk = clean_text[start_pos:end_pos]
+    for i in range(total_chunks):
+        chunk = raw_text[i * max_chunk_size : (i + 1) * max_chunk_size]
+        if not chunk.strip(): continue
+        
+        with st.spinner(f"Processing layer {i+1}/{total_chunks}..."):
+            records = ask_cloud_ai_to_parse_chunk(chunk)
+            if records:
+                all_records.extend(records)
 
-        with st.spinner(
-            f"AI engine evaluating processing layer {chunk_index + 1} of {total_chunks}..."
-        ):
-            extracted_chunk = ask_cloud_ai_to_parse_chunk(text_chunk)
-            if extracted_chunk:
-                all_extracted_records.extend(extracted_chunk)
-
-    return all_extracted_records
+    return all_records
