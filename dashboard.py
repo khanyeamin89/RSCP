@@ -6,10 +6,12 @@ import pandas as pd
 import plotly.express as px
 import requests
 import streamlit as st
+from supabase import create_client, Client
 
 st.set_page_config(page_title="Reactor Shop — Commissioning Progress Dashboard", layout="wide", page_icon="⚛️")
 
 SHOP_NAME = "Reactor Shop"
+BUCKET_NAME = "commissioning-files"
 
 # =============================================================================
 # 1. STYLING
@@ -46,8 +48,6 @@ st.markdown("""
 # =============================================================================
 # 2. CONSTANTS: COMMISSIONING MILESTONES
 # =============================================================================
-# All systems/equipment in this registry are assumed ALREADY INSTALLED.
-# What remains to track is the commissioning test sequence only.
 MILESTONES_ALL = ["IT", "PIC", "HT", "PT", "SAW"]
 
 MILESTONE_LABELS = {
@@ -58,9 +58,6 @@ MILESTONE_LABELS = {
     "SAW": "SAW – System Acceptance Walkdown",
 }
 
-# Which milestones apply to each scope tier. Assumption (stated per user's description):
-# Systems go through the full sequence; standalone Equipment typically only needs
-# IT / Flushing / Hydraulic checks. This is editable below if your scope differs.
 SCOPE_MILESTONES = {
     "System": ["IT", "PIC", "HT", "PT", "SAW"],
     "Equipment": ["IT", "PIC", "HT"],
@@ -82,16 +79,93 @@ REGISTRY_COLUMNS = (
     + ["Comments", "Source", "Last_Updated"]
 )
 
+# Python-style column name -> Supabase column name
+COLS_PY_TO_DB = {
+    "System": "system", "System_KKS": "system_kks", "Scope_Type": "scope_type",
+    "Component": "component", "Milestone_ID": "milestone_id",
+    "IT_Status": "it_status", "PIC_Status": "pic_status", "HT_Status": "ht_status",
+    "PT_Status": "pt_status", "SAW_Status": "saw_status",
+    "Comments": "comments", "Source": "source", "Last_Updated": "last_updated",
+}
+COLS_DB_TO_PY = {v: k for k, v in COLS_PY_TO_DB.items()}
+
+TESTLOG_PY_TO_DB = {
+    "Timestamp": "timestamp", "System": "system", "Component": "component",
+    "Test_Type": "test_type", "Test_Result": "test_result", "Severity": "severity",
+    "Resolved": "resolved", "Notes": "notes",
+}
+TESTLOG_DB_TO_PY = {v: k for k, v in TESTLOG_PY_TO_DB.items()}
+
 # =============================================================================
-# 3. SESSION STATE
+# 3. SUPABASE CONNECTION
 # =============================================================================
-if "db" not in st.session_state:
-    st.session_state.db = pd.DataFrame(columns=REGISTRY_COLUMNS)
-if "test_log" not in st.session_state:
-    st.session_state.test_log = pd.DataFrame(columns=[
-        "Timestamp", "System", "Component", "Test_Type",
-        "Test_Result", "Severity", "Resolved", "Notes"
-    ])
+@st.cache_resource
+def get_supabase_client() -> Client:
+    url = st.secrets["SUPABASE_URL"]
+    key = st.secrets["SUPABASE_KEY"]
+    return create_client(url, key)
+
+try:
+    supabase = get_supabase_client()
+except Exception:
+    st.error(
+        "⚠️ Couldn't connect to Supabase. Make sure `SUPABASE_URL` and `SUPABASE_KEY` are set in "
+        "`.streamlit/secrets.toml` (locally) or in your app's Settings → Secrets (on Streamlit Cloud)."
+    )
+    st.stop()
+
+# --- Registry ---
+def load_registry() -> pd.DataFrame:
+    res = supabase.table("registry").select("*").order("system").execute()
+    if not res.data:
+        return pd.DataFrame(columns=REGISTRY_COLUMNS)
+    df = pd.DataFrame(res.data).rename(columns=COLS_DB_TO_PY)
+    for c in REGISTRY_COLUMNS:
+        if c not in df.columns:
+            df[c] = ""
+    return df[REGISTRY_COLUMNS].fillna("")
+
+def upsert_registry_row(py_row: dict):
+    payload = {COLS_PY_TO_DB[k]: v for k, v in py_row.items() if k in COLS_PY_TO_DB}
+    payload["last_updated"] = datetime.now().isoformat()
+    supabase.table("registry").upsert(payload, on_conflict="system,component").execute()
+
+# --- Test log ---
+def load_test_log() -> pd.DataFrame:
+    res = supabase.table("test_log").select("*").order("timestamp", desc=True).execute()
+    cols = list(TESTLOG_PY_TO_DB.keys())
+    if not res.data:
+        return pd.DataFrame(columns=cols)
+    df = pd.DataFrame(res.data).rename(columns=TESTLOG_DB_TO_PY)
+    for c in cols:
+        if c not in df.columns:
+            df[c] = ""
+    return df[cols]
+
+def insert_test_log_row(py_row: dict):
+    payload = {TESTLOG_PY_TO_DB[k]: v for k, v in py_row.items() if k in TESTLOG_PY_TO_DB}
+    supabase.table("test_log").insert(payload).execute()
+
+# --- Uploaded files ---
+def upload_file_to_storage(file_bytes: bytes, file_name: str) -> str:
+    storage_path = f"{datetime.now().strftime('%Y%m%d%H%M%S')}_{file_name}"
+    supabase.storage.from_(BUCKET_NAME).upload(storage_path, file_bytes)
+    return storage_path
+
+def record_file_metadata(file_name: str, storage_path: str, rows_imported: int):
+    supabase.table("uploaded_files").insert({
+        "file_name": file_name, "storage_path": storage_path, "rows_imported": rows_imported,
+    }).execute()
+
+def load_uploaded_files() -> pd.DataFrame:
+    res = supabase.table("uploaded_files").select("*").order("uploaded_at", desc=True).execute()
+    return pd.DataFrame(res.data) if res.data else pd.DataFrame(
+        columns=["file_name", "storage_path", "uploaded_at", "rows_imported"]
+    )
+
+def get_file_download_url(storage_path: str) -> str:
+    res = supabase.storage.from_(BUCKET_NAME).create_signed_url(storage_path, 3600)
+    return res.get("signedURL") or res.get("signed_url", "")
 
 # =============================================================================
 # 4. HELPERS
@@ -122,13 +196,13 @@ def badge(status: str) -> str:
     label = status if status else "N/A"
     return f'<span class="badge" style="background:{color};">{label}</span>'
 
-def find_match(df, system, component):
+def find_match(df: pd.DataFrame, system: str, component: str):
     if df.empty or not system or not component:
         return None
     mask = (df["System"].str.strip().str.lower() == str(system).strip().lower()) & \
            (df["Component"].str.strip().str.lower() == str(component).strip().lower())
-    idx = df.index[mask]
-    return idx[0] if len(idx) else None
+    matches = df[mask]
+    return matches.iloc[0].to_dict() if len(matches) else None
 
 # =============================================================================
 # 5. LOCAL OLLAMA INTEGRATION — COMMISSIONING NOTE PARSER
@@ -136,11 +210,6 @@ def find_match(df, system, component):
 OLLAMA_URL = "http://localhost:11434/api/generate"
 
 def parse_commissioning_note_with_ai(user_input_text: str):
-    """
-    Parses a free-text shift/commissioning note into structured milestone
-    updates. Only fields the note actually addresses are populated; anything
-    not mentioned is returned as null so existing data isn't overwritten.
-    """
     try:
         prompt = f"""
         You are a commissioning data extractor at a nuclear power plant Reactor Shop.
@@ -267,7 +336,7 @@ def parse_workbook(file_bytes):
         except Exception as exc:
             skipped.append(f"{sheet} ({exc})")
 
-    return pd.DataFrame(rows), skipped
+    return rows, skipped
 
 # =============================================================================
 # 7. HEADER
@@ -276,7 +345,8 @@ st.markdown(f"""
 <div class="main-header">
   <h1>⚛️ {SHOP_NAME} — Commissioning Progress Dashboard</h1>
   <p>All systems and equipment in this registry are already installed. Tracking covers commissioning
-  test milestones only: IT, PIC (flushing), HT, PT, and SAW.</p>
+  test milestones only: IT, PIC (flushing), HT, PT, and SAW. Data is stored in Supabase and persists
+  across sessions and deployments.</p>
 </div>
 """, unsafe_allow_html=True)
 
@@ -284,26 +354,58 @@ with st.expander("ℹ️ Milestone abbreviations"):
     for m in MILESTONES_ALL:
         st.markdown(f"- **{m}** — {MILESTONE_LABELS[m].split('–')[1].strip()}")
     st.caption("Systems are tracked through all five milestones. Standalone equipment is tracked through "
-               "IT, PIC and HT by default — adjust in code if a specific component also needs PT/SAW.")
+               "IT, PIC and HT by default — adjust `SCOPE_MILESTONES` in code if a specific component also needs PT/SAW.")
 
 # =============================================================================
-# 8. SIDEBAR — DATA INPUT PANELS
+# 8. LOAD CURRENT DATA FROM SUPABASE
+# =============================================================================
+db = load_registry()
+test_log_df = load_test_log()
+
+# =============================================================================
+# 9. SIDEBAR — DATA INPUT PANELS
 # =============================================================================
 st.sidebar.header("📥 Commissioning Update Panels")
 
-# --- Panel A: Import registry (system/equipment list only) ---
+# --- Panel A: Import registry (file + parsed rows go to Supabase) ---
 with st.sidebar.expander("📁 Import System/Equipment Registry", expanded=False):
-    st.caption("Brings in the list of already-installed systems/equipment. Commissioning milestones start at Pending.")
+    st.caption("The uploaded file is stored in Supabase Storage, and the parsed system/equipment list "
+               "is upserted into the registry table. Commissioning milestones start at Pending.")
     uploaded = st.file_uploader("Upload systems/equipment tracker (.xlsx)", type=["xlsx"])
     if uploaded and st.button("Run Registry Import"):
-        with st.spinner("Reading workbook..."):
-            reg_df, skipped = parse_workbook(uploaded.getvalue())
-            if not reg_df.empty:
-                st.session_state.db = pd.concat([st.session_state.db, reg_df], ignore_index=True) \
-                    .drop_duplicates(subset=["System", "Component"], keep="last")
-                st.success(f"✅ Imported {len(reg_df)} registry lines.")
+        with st.spinner("Uploading file and reading workbook..."):
+            file_bytes = uploaded.getvalue()
+            try:
+                storage_path = upload_file_to_storage(file_bytes, uploaded.name)
+            except Exception as exc:
+                storage_path = None
+                st.warning(f"File parsed but couldn't be saved to Storage: {exc}")
+
+            rows, skipped = parse_workbook(file_bytes)
+            for row in rows:
+                upsert_registry_row(row)
+
+            if storage_path:
+                record_file_metadata(uploaded.name, storage_path, len(rows))
+
+            st.success(f"✅ Imported {len(rows)} registry lines into Supabase.")
             if skipped:
                 st.warning(f"Skipped {len(skipped)} non-conforming sheets.")
+            st.rerun()
+
+    files_df = load_uploaded_files()
+    if not files_df.empty:
+        st.markdown("**Previously uploaded files**")
+        for _, f in files_df.iterrows():
+            try:
+                url = get_file_download_url(f["storage_path"])
+            except Exception:
+                url = None
+            label = f"{f['file_name']} — {f['rows_imported']} rows ({str(f['uploaded_at'])[:16]})"
+            if url:
+                st.markdown(f"[{label}]({url})")
+            else:
+                st.caption(label)
 
 # --- Panel B: AI free-text commissioning update ---
 with st.sidebar.expander("🤖 AI Commissioning Update", expanded=True):
@@ -317,9 +419,9 @@ with st.sidebar.expander("🤖 AI Commissioning Update", expanded=True):
         with st.spinner("Parsing note..."):
             extracted = parse_commissioning_note_with_ai(ai_raw_text)
             if extracted:
-                match_idx = find_match(st.session_state.db, extracted.get("System", ""), extracted.get("Component", ""))
-                if match_idx is not None:
-                    base = st.session_state.db.loc[match_idx].to_dict()
+                match = find_match(db, extracted.get("System", ""), extracted.get("Component", ""))
+                if match is not None:
+                    base = match
                     is_update = True
                 else:
                     scope_guess = extracted.get("Scope_Type", "Equipment")
@@ -344,12 +446,10 @@ with st.sidebar.expander("🤖 AI Commissioning Update", expanded=True):
 
                 st.session_state.staged_ai_data = merged
                 st.session_state.staged_ai_is_update = is_update
-                st.session_state.staged_ai_match_idx = match_idx
                 st.success("Parsed! Review below.")
             else:
                 st.error("Couldn't reach the local AI model (Ollama/llama3.2). You can fill the update in manually below instead.")
 
-# --- Confirmation panel for staged AI data ---
 if "staged_ai_data" in st.session_state:
     with st.sidebar.container():
         st.markdown("#### ✅ Confirm Commissioning Update")
@@ -374,7 +474,7 @@ if "staged_ai_data" in st.session_state:
                         current_val = "Pending"
                     milestone_vals[m] = st.selectbox(m, STATUS_OPTIONS, index=STATUS_OPTIONS.index(current_val), key=f"conf_{m}")
                 else:
-                    st.selectbox(m, ["N/A"], index=0, key=f"conf_{m}_na", disabled=True)
+                    st.selectbox(m, ["N/A"], index=0, disabled=True, key=f"conf_{m}_na")
                     milestone_vals[m] = "N/A"
 
         conf_comm = st.text_area("Remarks", value=s.get("Comments", ""), key="conf_comm")
@@ -384,36 +484,27 @@ if "staged_ai_data" in st.session_state:
                 "System": conf_sys, "System_KKS": conf_kks, "Scope_Type": conf_tier, "Component": conf_comp,
                 "Milestone_ID": s.get("Milestone_ID", "AI-LOG"),
                 "Comments": conf_comm, "Source": "AI Update Engine",
-                "Last_Updated": datetime.now().strftime("%Y-%m-%d %H:%M"),
             }
             for m in MILESTONES_ALL:
                 row_map[f"{m}_Status"] = milestone_vals[m]
 
-            match_idx = st.session_state.get("staged_ai_match_idx")
-            if match_idx is not None and match_idx in st.session_state.db.index:
-                for key, val in row_map.items():
-                    st.session_state.db.loc[match_idx, key] = val
-            else:
-                st.session_state.db = pd.concat([st.session_state.db, pd.DataFrame([row_map])], ignore_index=True)
+            upsert_registry_row(row_map)
 
-            st.success("Commissioning record updated!")
+            st.success("Commissioning record saved to Supabase!")
             del st.session_state.staged_ai_data
             st.session_state.pop("staged_ai_is_update", None)
-            st.session_state.pop("staged_ai_match_idx", None)
             st.rerun()
 
 # --- Panel C: Manual add / quick update ---
 with st.sidebar.expander("🛠️ Manual Add / Update", expanded=False):
     existing_keys = []
-    if not st.session_state.db.empty:
-        existing_keys = (st.session_state.db["System"] + " — " + st.session_state.db["Component"]).tolist()
+    if not db.empty:
+        existing_keys = (db["System"] + " — " + db["Component"]).tolist()
     pick = st.selectbox("Update existing record (optional)", ["— New record —"] + existing_keys, key="manual_pick")
 
     if pick != "— New record —":
-        sel_idx = existing_keys.index(pick)
-        sel_row = st.session_state.db.iloc[sel_idx]
+        sel_row = db.iloc[existing_keys.index(pick)]
     else:
-        sel_idx = None
         sel_row = None
 
     with st.form("manual_entry_form"):
@@ -443,25 +534,17 @@ with st.sidebar.expander("🛠️ Manual Add / Update", expanded=False):
                     "System": man_sys, "System_KKS": man_kks, "Scope_Type": man_type, "Component": man_comp,
                     "Milestone_ID": sel_row["Milestone_ID"] if sel_row is not None else "MANUAL",
                     "Comments": man_note, "Source": "Manual Entry",
-                    "Last_Updated": datetime.now().strftime("%Y-%m-%d %H:%M"),
                 }
                 for m in MILESTONES_ALL:
                     row_map[f"{m}_Status"] = man_status[m]
 
-                if sel_idx is not None:
-                    real_idx = st.session_state.db.index[sel_idx]
-                    for key, val in row_map.items():
-                        st.session_state.db.loc[real_idx, key] = val
-                else:
-                    st.session_state.db = pd.concat([st.session_state.db, pd.DataFrame([row_map])], ignore_index=True)
-                st.success("Saved!")
+                upsert_registry_row(row_map)
+                st.success("Saved to Supabase!")
                 st.rerun()
 
 # =============================================================================
-# 9. MAIN DASHBOARD
+# 10. MAIN DASHBOARD
 # =============================================================================
-db = st.session_state.db.copy()
-
 if not db.empty:
     db["Progress_%"] = db.apply(compute_progress, axis=1)
 
@@ -496,7 +579,6 @@ if not db.empty:
         ["📈 Progress Overview", "🧩 Commissioning Status Matrix", "🧪 Test Logs", "📋 Master Registry"]
     )
 
-    # --- Charts ---
     with tab_charts:
         g1, g2 = st.columns(2)
         with g1:
@@ -524,7 +606,6 @@ if not db.empty:
             fig2.update_layout(yaxis_title="Number of Records")
             st.plotly_chart(fig2, use_container_width=True)
 
-    # --- Status Matrix (colored badge table) ---
     with tab_matrix:
         search = st.text_input("🔍 Filter by system or component", "")
         scope_filter = st.radio("Scope", ["All", "System", "Equipment"], horizontal=True)
@@ -565,7 +646,6 @@ if not db.empty:
             </table>"""
             st.markdown(table_html, unsafe_allow_html=True)
 
-    # --- Test Logs ---
     with tab_logs:
         st.markdown("#### Log a Commissioning Test Result")
         with st.form("test_logging_subform"):
@@ -581,19 +661,18 @@ if not db.empty:
 
             if st.form_submit_button("Save Test Log"):
                 new_log = {
-                    "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                    "Timestamp": datetime.now().isoformat(),
                     "System": log_sys, "Component": log_comp, "Test_Type": log_phase,
                     "Test_Result": log_res, "Severity": log_sev,
                     "Resolved": log_res == "Passed", "Notes": log_text,
                 }
-                st.session_state.test_log = pd.concat([st.session_state.test_log, pd.DataFrame([new_log])], ignore_index=True)
-                st.success("Test log saved.")
+                insert_test_log_row(new_log)
+                st.success("Test log saved to Supabase.")
                 st.rerun()
 
-        if not st.session_state.test_log.empty:
-            st.dataframe(st.session_state.test_log, use_container_width=True)
+        if not test_log_df.empty:
+            st.dataframe(test_log_df, use_container_width=True)
 
-    # --- Master Registry ---
     with tab_master:
         st.dataframe(db, use_container_width=True)
         csv_bytes = db.to_csv(index=False).encode("utf-8")
