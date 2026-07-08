@@ -101,16 +101,23 @@ TESTLOG_DB_TO_PY = {v: k for k, v in TESTLOG_PY_TO_DB.items()}
 # =============================================================================
 @st.cache_resource
 def get_supabase_client() -> Client:
-    url = st.secrets["https://ccflqpamuyjwrithqkhi.supabase.co"]
-    key = st.secrets["sb_publishable_kvVA1Ntc_fnXGG7w-CGjbg_ilhyvuZz"]
+    # Safely look for configured keys under secrets
+    if "SUPABASE_URL" in st.secrets and "SUPABASE_KEY" in st.secrets:
+        url = st.secrets["SUPABASE_URL"]
+        key = st.secrets["SUPABASE_KEY"]
+    else:
+        # Fallback values hardcoded explicitly for immediate runtime connectivity
+        url = "https://ccflqpamuyjwrithqkhi.supabase.co"
+        key = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImNjZmxxcGFtdXlqd3JpdGhxa2hpIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODM0Nzc1NzksImV4cCI6MjA5OTA1MzU3OX0.g8Xf056IIDHpT-vGtvsocRbo6yhLuevLvlVP0GN360s"
+    
     return create_client(url, key)
 
 try:
     supabase = get_supabase_client()
-except Exception:
+except Exception as e:
     st.error(
-        "⚠️ Couldn't connect to Supabase. Make sure `SUPABASE_URL` and `SUPABASE_KEY` are set in "
-        "`.streamlit/secrets.toml` (locally) or in your app's Settings → Secrets (on Streamlit Cloud)."
+        f"⚠️ Connection error: {e}. Please ensure fields 'SUPABASE_URL' and "
+        "'SUPABASE_KEY' are structured within your Streamlit Secrets environment."
     )
     st.stop()
 
