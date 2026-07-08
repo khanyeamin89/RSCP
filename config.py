@@ -1,52 +1,78 @@
-import re
+"""
+Reactor Shop Commissioning - Centralized Configuration
+======================================================
+Contains all constants, schema definitions, and shared utilities.
+"""
+
 import streamlit as st
-from supabase import create_client, Client
+from supabase import create_client
+from functools import lru_cache
+from typing import Dict, List, Set, Tuple, Optional, Any
+from dataclasses import dataclass
+from enum import Enum
+
+# =============================================================================
+# PAGE CONFIGURATION
+# =============================================================================
 
 PAGE_TITLE = "Reactor Shop Commissioning Dashboard"
 PAGE_ICON = "⚛️"
 
 # =============================================================================
-# Single source of truth for commissioning milestones and KKS scope rules.
-# Imported by database.py, ai_engine.py, and dashboard.py so all three stay
-# in sync — previously each file re-implemented parts of this independently.
+# KKS TAXONOMY DEFINITIONS
 # =============================================================================
-MILESTONES = ["IT", "PIC", "HT", "PT", "SAW"]
 
-MILESTONE_LABELS = {
-    "IT": "IT – Individual Test",
-    "PIC": "PIC – Post Installation Cleaning / Flushing",
-    "HT": "HT – Hydro Test",
-    "PT": "PT – Pneumatic Test",
-    "SAW": "SAW – Start-up and Adjustment Work",
+class ScopeType(str, Enum):
+    SYSTEM = "System"
+    EQUIPMENT = "Equipment"
+
+# Valid KKS prefixes by scope
+SYSTEM_PREFIXES: Set[str] = {'JEA', 'JAA', 'JEB', 'JAB', 'JEC', 'JAC', 'JED', 'JAD'}
+EQUIPMENT_PREFIXES: Set[str] = {'AA', 'AP', 'AH', 'AT', 'AN', 'AB', 'AC', 'AD', 'AE'}
+
+# Milestone field names
+MILESTONES: List[str] = ['it_status', 'pic_status', 'ht_status', 'pt_status', 'saw_status']
+
+# Milestones that are N/A for Equipment scope
+EQUIPMENT_NA_MILESTONES: Set[str] = {'pt_status', 'saw_status'}
+
+# Valid status values for any milestone
+VALID_STATUSES: Set[str] = {"Pending", "In Progress", "Completed", "Failed", "N/A", "Not Applicable"}
+
+# Milestone dependency chain: prerequisite -> dependent
+MILESTONE_DEPENDENCIES: Dict[str, str] = {
+    'pic_status': 'ht_status',   # PIC must be Completed before HT can be Completed
 }
 
-# System-scope KKS codes (3-letter prefix) go through the full sequence.
-# Equipment-scope KKS codes (2-letter prefix) skip PT and SAW.
-SCOPE_MILESTONES = {
-    "System": ["IT", "PIC", "HT", "PT", "SAW"],
-    "Equipment": ["IT", "PIC", "HT"],
+# =============================================================================
+# DATABASE SCHEMA (Registry Table)
+# =============================================================================
+
+REGISTRY_SCHEMA: Dict[str, type] = {
+    "system": str,
+    "system_kks": str,
+    "scope_type": str,
+    "component": str,
+    "it_status": str,
+    "pic_status": str,
+    "ht_status": str,
+    "pt_status": str,
+    "saw_status": str,
+    "comments": str,
 }
 
-STATUS_OPTIONS = ["Pending", "In Progress", "Completed", "Failed", "N/A"]
+REGISTRY_REQUIRED_FIELDS: Set[str] = {"system", "component", "system_kks"}
+REGISTRY_UNIQUE_KEYS: List[str] = ["system", "component"]
 
-STATUS_BADGE_CLASS = {
-    "Completed": "badge-verified",
-    "In Progress": "badge-progress",
-    "Pending": "badge-pending",
-    "Failed": "badge-failed",
-    "N/A": "badge-na",
-}
+# =============================================================================
+# SUPABASE CLIENT (Single Source of Truth)
+# =============================================================================
 
-
-@st.cache_resource
-def get_supabase_client() -> Client:
+@st.cache_resource(show_spinner=False)
+def get_supabase_client():
     """
     Initializes and caches the connection to the Supabase backend.
     Enforces strict verification of environment variables before allowing execution.
-
-    This is the ONLY place the client should be constructed — database.py
-    previously duplicated this logic locally, which risked the two copies
-    drifting out of sync. Import this function instead of redefining it.
     """
     url = st.secrets.get("SUPABASE_URL")
     key = st.secrets.get("SUPABASE_KEY")
@@ -59,60 +85,155 @@ def get_supabase_client() -> Client:
         st.stop()
 
     try:
-        return create_client(url, key)
+        client = create_client(url, key)
+        # Verify connection with a lightweight ping
+        client.table("registry").select("count", count="exact").limit(0).execute()
+        return client
     except Exception as initialization_error:
         st.error(f"Failed to establish Supabase Client core interface: {str(initialization_error)}")
         st.stop()
 
+# =============================================================================
+# KKS VALIDATION ENGINE
+# =============================================================================
 
-def get_kks_scope(kks_code: str) -> str:
+def validate_kks(kks_code: str) -> Tuple[bool, str, Optional[ScopeType]]:
     """
-    General KKS taxonomy rule:
-      - 3-letter alphabetic prefix -> "System"    (e.g. JEA, JAA, JEC)
-      - 2-letter alphabetic prefix -> "Equipment" (e.g. AA, AP)
+    Validates a KKS code and determines its scope.
 
-    This replaces the previous hardcoded whitelist of specific prefixes
-    (which silently misclassified any valid code it hadn't seen before).
-    Falls back to "Equipment" — the narrower, more conservative scope —
-    if the code doesn't cleanly resolve to 2 or 3 letters.
+    Returns:
+        (is_valid: bool, message: str, scope: ScopeType|None)
     """
-    code = str(kks_code).strip().upper()
-    match = re.match(r"^[A-Z]+", code)
-    prefix = match.group(0) if match else ""
+    if not kks_code or not isinstance(kks_code, str):
+        return False, "KKS code must be a non-empty string", None
 
-    if len(prefix) == 3:
-        return "System"
-    if len(prefix) == 2:
-        return "Equipment"
-    return "Equipment"  # ambiguous/unrecognized code — flagged by caller for review
+    kks_upper = kks_code.upper().strip()
+    prefix = ''.join(c for c in kks_upper if c.isalpha())[:3]  # Extract leading letters
+
+    if prefix in SYSTEM_PREFIXES:
+        return True, f"Valid System KKS: {prefix}", ScopeType.SYSTEM
+    elif prefix[:2] in EQUIPMENT_PREFIXES:
+        return True, f"Valid Equipment KKS: {prefix[:2]}", ScopeType.EQUIPMENT
+    else:
+        return False, f"Unknown KKS prefix '{prefix}'. Expected System: {SYSTEM_PREFIXES} or Equipment: {EQUIPMENT_PREFIXES}", None
 
 
-def default_status_for(scope_tier: str, milestone: str) -> str:
-    return "Pending" if milestone in SCOPE_MILESTONES.get(scope_tier, []) else "N/A"
+def get_kks_scope(kks_code: str) -> Optional[ScopeType]:
+    """Returns the scope type for a given KKS code, or None if invalid."""
+    valid, _, scope = validate_kks(kks_code)
+    return scope if valid else None
 
 
-def badge(status: str) -> str:
-    """Render a status value as a colored HTML badge using the CSS classes below."""
-    css_class = STATUS_BADGE_CLASS.get(status, "badge-pending")
-    label = status if status else "N/A"
-    return f'<span class="badge {css_class}">{label}</span>'
+def enforce_scope_milestones(record: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
+    """
+    Enforces milestone rules based on KKS scope.
+    - System: all milestones active
+    - Equipment: PT and SAW set to 'N/A'
 
+    Returns:
+        (enriched_record, alerts)
+    """
+    alerts = []
+    kks = record.get('system_kks', '')
+    scope = get_kks_scope(kks)
+
+    if scope is None:
+        alerts.append(f"WARNING: Could not determine scope for KKS '{kks}'. Leaving milestones as-is.")
+        return record, alerts
+
+    record['scope_type'] = scope.value
+
+    if scope == ScopeType.EQUIPMENT:
+        for ms in EQUIPMENT_NA_MILESTONES:
+            current = record.get(ms, '')
+            if current and current not in ('N/A', 'Not Applicable', ''):
+                alerts.append(
+                    f"ALERT: KKS '{kks}' (Equipment scope) has non-N/A value '{current}' for '{ms}'. "
+                    f"Auto-corrected to 'N/A'. Equipment does not require {ms.replace('_status', '').upper()}."
+                )
+            record[ms] = 'N/A'
+
+    return record, alerts
+
+
+# =============================================================================
+# MILESTONE DEPENDENCY VALIDATOR
+# =============================================================================
+
+def validate_milestone_dependencies(record: Dict[str, Any]) -> List[str]:
+    """
+    Validates that milestone dependencies are satisfied.
+    Currently enforces: PIC must be 'Completed' before HT can be 'Completed'.
+
+    Returns list of violation messages (empty if all valid).
+    """
+    violations = []
+
+    for prereq, dependent in MILESTONE_DEPENDENCIES.items():
+        prereq_val = record.get(prereq, '').strip().lower()
+        dependent_val = record.get(dependent, '').strip().lower()
+
+        if dependent_val == 'completed' and prereq_val != 'completed':
+            violations.append(
+                f"DEPENDENCY VIOLATION: '{dependent}' is marked 'Completed' but prerequisite "
+                f"'{prereq}' is '{record.get(prereq, 'N/A')}'. "
+                f"{prereq.replace('_status', '').upper()} must be Completed before {dependent.replace('_status', '').upper()}."
+            )
+
+    return violations
+
+
+# =============================================================================
+# RECORD VALIDATOR
+# =============================================================================
+
+def validate_record(record: Dict[str, Any]) -> Tuple[bool, List[str]]:
+    """
+    Full validation of a registry record.
+    Returns (is_valid, list_of_issues).
+    """
+    issues = []
+
+    # Check required fields
+    for field in REGISTRY_REQUIRED_FIELDS:
+        if not record.get(field):
+            issues.append(f"Missing required field: '{field}'")
+
+    # Validate KKS
+    kks = record.get('system_kks', '')
+    valid_kks, kks_msg, scope = validate_kks(kks)
+    if not valid_kks:
+        issues.append(f"KKS Validation Error: {kks_msg}")
+
+    # Validate status values
+    for ms in MILESTONES:
+        val = record.get(ms, '')
+        if val and val not in VALID_STATUSES:
+            issues.append(f"Invalid status '{val}' for '{ms}'. Valid: {VALID_STATUSES}")
+
+    # Check dependencies
+    dep_issues = validate_milestone_dependencies(record)
+    issues.extend(dep_issues)
+
+    return len(issues) == 0, issues
+
+
+# =============================================================================
+# CUSTOM CSS
+# =============================================================================
 
 def apply_custom_css():
     """
     Injects custom CSS styling into the Streamlit DOM to optimize workspace layout,
     improve visual hierarchy, and enforce professional engineering aesthetics.
-
-    NOTE: this must be called explicitly near the top of dashboard.py — it was
-    defined but never invoked in the original file, so none of this ever rendered.
     """
     st.markdown(
         """
         <style>
         /* Optimize viewport real estate */
-        .block-container {
-            padding-top: 1.5rem;
-            padding-bottom: 1.5rem;
+        .block-container { 
+            padding-top: 1.5rem; 
+            padding-bottom: 1.5rem; 
             max-width: 95% !important;
         }
 
@@ -126,17 +247,23 @@ def apply_custom_css():
         [data-testid="stMetricLabel"] { font-weight: 600; color: #64748B; text-transform: uppercase; font-size: 0.8rem; }
 
         /* Status Badges */
-        .badge { padding: 4px 8px; border-radius: 4px; font-weight: bold; font-size: 12px; display: inline-block; min-width: 76px; text-align: center; }
+        .badge { padding: 4px 8px; border-radius: 4px; font-weight: bold; font-size: 12px; }
         .badge-verified { background-color: #DCFCE7; color: #15803D; }
         .badge-progress { background-color: #FEF9C3; color: #A16207; }
-        .badge-pending  { background-color: #F1F5F9; color: #475569; }
-        .badge-failed   { background-color: #FEE2E2; color: #B91C1C; }
-        .badge-na       { background-color: #F1F5F9; color: #94A3B8; }
+        .badge-pending { background-color: #F1F5F9; color: #475569; }
+        .badge-failed { background-color: #FEE2E2; color: #B91C1C; }
+        .badge-na { background-color: #E2E8F0; color: #475569; font-style: italic; }
 
-        .matrix-table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
-        .matrix-table th { background: #0F172A; color: white; padding: 8px 10px; text-align: left; }
-        .matrix-table td { padding: 7px 10px; border-bottom: 1px solid #eef2f7; vertical-align: middle; }
-        .matrix-table tr:hover { background: #f8fafc; }
+        /* Alert Boxes */
+        .alert-box {
+            padding: 12px 16px;
+            border-radius: 8px;
+            margin: 8px 0;
+            border-left: 4px solid;
+        }
+        .alert-warning { background-color: #FEF9C3; border-color: #EAB308; color: #854D0E; }
+        .alert-error { background-color: #FEE2E2; border-color: #EF4444; color: #991B1B; }
+        .alert-info { background-color: #DBEAFE; border-color: #3B82F6; color: #1E40AF; }
         </style>
         """,
         unsafe_allow_html=True,
