@@ -1,295 +1,494 @@
 """
-AI parsing engine — turns free-text shift notes or uploaded registry files
-into structured commissioning records.
+Reactor Shop Commissioning - AI Processing Engine
+==================================================
+Natural language parsing, KKS classification, and intelligent data extraction.
 
-Uses Groq's hosted API rather than local Ollama, so this works when deployed
-to Streamlit Community Cloud (there's no localhost Ollama server there).
-Requires GROQ_API_KEY in Streamlit secrets.
+KKS Coding based on Rooppur NPP document RPR-QM-AEB0001 Revision B05 (2017)
+"Agreement on Using the KKS Coding System" (VGB-B 105 E 2010, VGB-B 106 E 2004)
+
+Bilingual support: Russian (original document language) -> English translations
 """
-import io
-import re
+
 import json
 import hashlib
-import requests
 import streamlit as st
+import pandas as pd
+from io import BytesIO
+from typing import Dict, List, Any, Tuple, Optional
 
-from config import MILESTONES, SCOPE_MILESTONES
-from database import upsert_registry_row, check_chunk_exists, mark_chunk_done, \
-    upload_file_to_storage, record_file_metadata
-
-CHUNK_CHAR_LIMIT = 30000
-
-SYSTEM_PROMPT = f"""
-You are a commissioning data extractor for a nuclear power plant Reactor Shop.
-
-KKS TAXONOMY:
-- System KKS: a 3-letter code (e.g. JEA, JAA, JEC).
-- Equipment KKS: a 2-letter code (e.g. AA, AP).
-
-COMMISSIONING MILESTONES: {", ".join(m.upper() for m in MILESTONES)}
-- IT: Individual Test
-- PIC: Post Installation Cleaning / Flushing
-- HT: Hydro Test
-- PT: Pneumatic Test
-- SAW: Start-up and Adjustment Work
-
-RULES:
-1. If the KKS prefix has 3 letters, scope_type = "System" (all five milestones apply).
-   If it has 2 letters, scope_type = "Equipment" (pt_status and saw_status must be "N/A").
-2. PIC (flushing) should normally be completed before HT (hydro test) is meaningful —
-   if a note reports HT progress while PIC is not Completed, still record what the
-   note says, but do not invent a PIC status that wasn't mentioned.
-3. Only set a milestone status field if the note actually addresses that milestone.
-   Leave unmentioned fields out of the JSON entirely (do not guess).
-4. Do not create duplicate records — every record is matched by (system, component).
-
-LANGUAGE:
-Source notes and spreadsheets from this plant are frequently in Russian, English,
-or a mix of both in the same row (e.g. bilingual column headers, Cyrillic status
-words like "Выполнено"). Read and understand Russian text. Always translate
-`comments` into English, and always output status values using the English
-canonical vocabulary below — never leave a Russian word in a status field.
-
-Extract data to a single JSON object (or a JSON object with a "records" list for
-multiple items) using only these keys: system, system_kks, scope_type, component,
-it_status, pic_status, ht_status, pt_status, saw_status, comments.
-Status values must be one of: Pending, In Progress, Completed, Failed, N/A.
-Output JSON only — no markdown, no explanation.
-"""
+from database import upsert_registry_row, check_chunk_exists, mark_chunk_done
+from config import (
+    get_kks_scope,
+    enforce_scope_milestones,
+    validate_milestone_dependencies,
+    validate_f0,
+    validate_room_code,
+    validate_a3,
+    get_system_family,
+    get_system_family_ru,
+    get_bilingual_system_family,
+    get_bilingual_label,
+    get_bilingual_display,
+    ScopeType,
+    SYSTEM_PREFIXES,
+    EQUIPMENT_PREFIXES,
+    F0_PREFIXES,
+    A3_CODES,
+    ROOM_SHAFT_CODES,
+    SYSTEM_FAMILY_CODES,
+    MILESTONES,
+    MILESTONE_LABELS,
+    VALID_STATUSES,
+)
 
 
-# Deterministic safety net: even though the prompt instructs the model to
-# translate statuses into English, this catches any Russian term that slips
-# through un-translated so it still lands in a valid canonical status rather
-# than being silently rejected downstream.
-RU_STATUS_MAP = {
-    "выполнено": "Completed", "завершено": "Completed", "выполнен": "Completed",
-    "в процессе": "In Progress", "выполняется": "In Progress", "в работе": "In Progress",
-    "не начато": "Pending", "не выполнено": "Pending", "ожидание": "Pending",
-    "отклонено": "Failed", "не пройдено": "Failed", "неудачно": "Failed",
-    "не применимо": "N/A", "н/п": "N/A",
-}
+# =============================================================================
+# GROQ API INTEGRATION
+# =============================================================================
 
-
-def normalize_status(value: str) -> str:
-    """Maps a Russian status term to its English canonical equivalent, if
-    recognized. Leaves already-English values (or unrecognized ones)
-    untouched — validation against STATUS_OPTIONS happens by the caller."""
-    if not value:
-        return value
-    key = str(value).strip().lower()
-    return RU_STATUS_MAP.get(key, value)
-
-
-def get_kks_scope(kks_code: str) -> str:
+def ask_groq(prompt: str, max_retries: int = 2) -> Optional[Dict[str, Any]]:
     """
-    Determines System vs Equipment scope from KKS prefix length, per the
-    ROLE spec: 3-letter prefix = System, 2-letter prefix = Equipment.
+    Groq API wrapper with JSON enforcement, retry logic, and error handling.
 
-    (The previous implementation used a hardcoded whitelist of specific
-    prefixes, which silently misclassified anything not on the list. This
-    checks the actual letter-length rule instead.)
+    Args:
+        prompt: The text to send to the LLM
+        max_retries: Number of retry attempts on failure
+
+    Returns:
+        Parsed JSON dict or None on failure
     """
-    if not kks_code:
-        return "Equipment"
-    first_token = str(kks_code).split(",")[0].strip()
-    letters = re.sub(r"[^A-Za-z]", "", first_token).upper()
-    if len(letters) == 3:
-        return "System"
-    if len(letters) == 2:
-        return "Equipment"
-    # Ambiguous length (not 2 or 3 letters) — default to the safer,
-    # more restrictive scope and let the reviewer correct it if wrong.
-    return "Equipment"
+    import requests
+    import time
 
-
-def enforce_scope_rules(record: dict) -> list[str]:
-    """
-    Applies scope-based N/A enforcement and flags milestone-dependency
-    issues (PIC should precede HT). Mutates `record` in place to correct
-    invalid milestone/scope combinations, and returns a list of
-    human-readable alerts to show the user.
-    """
-    alerts = []
-    scope = record.get("scope_type") or get_kks_scope(record.get("system_kks", ""))
-    record["scope_type"] = scope
-    applicable = SCOPE_MILESTONES.get(scope, SCOPE_MILESTONES["Equipment"])
-
-    # Catch any Russian status term the model didn't translate.
-    for m in MILESTONES:
-        key = f"{m}_status"
-        if record.get(key):
-            record[key] = normalize_status(record[key])
-
-    for m in MILESTONES:
-        key = f"{m}_status"
-        if m not in applicable and record.get(key) not in (None, "", "N/A"):
-            alerts.append(
-                f"⚠️ '{m.upper()}' was set to '{record.get(key)}' on "
-                f"'{record.get('component', '(unnamed)')}', but {m.upper()} is N/A "
-                f"for Equipment-scope items. Overriding to N/A."
-            )
-            record[key] = "N/A"
-
-    ht_val = record.get("ht_status")
-    pic_val = record.get("pic_status")
-    if ht_val in ("In Progress", "Completed") and pic_val not in ("Completed", None, ""):
-        if pic_val != "Completed":
-            alerts.append(
-                f"⚠️ HT is being marked '{ht_val}' for '{record.get('component', '(unnamed)')}' "
-                f"but PIC (flushing) is currently '{pic_val}', not Completed. "
-                f"Verify flushing was actually finished before relying on this hydro test."
-            )
-
-    if not record.get("system") or not record.get("component"):
-        alerts.append(
-            "⚠️ A parsed record is missing 'system' or 'component' — it was skipped "
-            "because upserts require both to identify the row."
-        )
-    return alerts
-
-
-def ask_groq(prompt: str):
-    """Groq API wrapper with JSON enforcement and proper error handling."""
     api_key = st.secrets.get("GROQ_API_KEY")
     if not api_key:
-        st.error("GROQ_API_KEY is missing from Streamlit Secrets — the AI parser can't run without it.")
+        st.error("GROQ_API_KEY not found in Streamlit secrets.")
         return None
+
+    system_prompt = """You are a nuclear commissioning data extraction expert for the Rooppur NPP project.
+
+Extract commissioning registry data from the provided shift notes into valid JSON.
+
+KKS CODING RULES (Rooppur NPP RPR-QM-AEB0001 Rev B05 2017):
+- KKS = Kraftwerk-Kennzeichensystem, developed by VGB (German industrialists association)
+- Code structure: F0 (MANDATORY prefix) + F1F2F3 (functional system, 3 letters) + Fn (00-99) + A1 (equipment unit letter) + An (001-999) + Bn (01-99 component)
+- F0 is MANDATORY: 0=common-station (Общестанционные), 1=Unit 1 (Блок 1), 2=Unit 2 (Блок 2), 9=temporary (Временные)
+- Special F0: 1&2=safety train elements (Элементы системы безопасности), 0=normal operation (Нормальная эксплуатация), 5=HVAC from NO diesel-generator (ОВиК от дизель-генератора НЭ)
+- System families: A=Networks/Switchgears (Сети/РУ), B=Power transmission/Auxiliary supply (Передача энергии/Вспомогательное питание), C=I&C equipment (КИПиА), E=Fuel/Waste (Топливо/Отходы), F=Nuclear fuel handling (Обращение с ядерным топливом), G=Water supply/Waste removal (Водоснабжение/Удаление отходов)
+- A3 alphabetic code: P=pulse valve (Импульсный клапан), S=safety valve (Предохранительный клапан), D=double drive (Двойной привод), M=multiple power supply (Множественное питание), L=measurement loop (Измерительный контур), A/B/C=electrical phases (Электрические фазы), N=working lighting (Рабочее освещение), E=emergency lighting (Аварийное освещение), F=escape lighting (Эвакуационное освещение)
+- Room coding: Cartesian coordinates (Декартовы координаты), A1 contains R, 3-digit numbering (3-значная нумерация), shaft codes: 3NN=transport (Транспортный), 4NN=cable (Кабельный), 5NN=stair (Лестничный), 6NN=elevator (Лифтовой), 7NN=reactor cavity (Реакторный колодец), 8NN=process (Технологический), 9NN=ventilation (Вентиляционный)
+- Equipment unit numbering: 001-900 per Appendix B (limitation: full Appendix B not available)
+- Milestones: IT=Individual Test (ИО=Индивидуальные испытания), PIC=Post-Install Cleaning (ПОМ=Послеустановочная мойка), HT=Hydro Test (ГИ=Гидравлические испытания), PT=Pneumatic Test (ПН=Пневматические испытания), SAW=Start-up & Adjustment (ПНР=Пусконаладочные работы)
+
+OUTPUT FORMAT:
+{
+    "records": [
+        {
+            "system": "System Name",
+            "system_kks": "KKS Code with mandatory F0 prefix",
+            "scope_type": "System|Equipment|Room",
+            "component": "Component Tag",
+            "it_status": "Pending|In Progress|Completed|Failed|N/A",
+            "pic_status": "Pending|In Progress|Completed|Failed|N/A",
+            "ht_status": "Pending|In Progress|Completed|Failed|N/A",
+            "pt_status": "Pending|In Progress|Completed|Failed|N/A",
+            "saw_status": "Pending|In Progress|Completed|Failed|N/A",
+            "comments": "Any relevant notes including KKS context and Russian terms if present"
+        }
+    ]
+}
+
+RULES:
+1. Identify KKS codes first. F0 prefix is MANDATORY (0,1,2,5,9).
+2. System KKS: F0 + 3-letter system code (JEA, JAA, etc. or A-family, B-family, etc.).
+3. Equipment KKS: F0 + 2-letter equipment prefix (AA, AP, etc.) + numbering.
+4. Room KKS: contains "R" in A1 position, uses Cartesian coordinates.
+5. Status keywords: "done", "complete", "finished", "passed", "выполнено", "завершено" -> "Completed"
+6. Status keywords: "ongoing", "in progress", "started", "в работе", "выполняется" -> "In Progress"
+7. Status keywords: "failed", "rejected", "issue", "не пройдено", "отказ" -> "Failed"
+8. Status keywords: "pending", "not started", "awaiting", "в ожидании", "не начато" -> "Pending"
+9. If a milestone is not mentioned, default to "Pending".
+10. For Equipment scope, PT and SAW should be "N/A".
+11. For Room scope, all milestones should be "N/A".
+12. PIC (Post Installation Cleaning / Послеустановочная мойка) must precede HT (Hydro Test / Гидравлические испытания).
+13. Include any anomalies, KKS code issues, or special notes in "comments".
+14. If scope cannot be determined from KKS, infer from context ("system" vs "equipment" vs "room").
+15. If equipment unit numbering seems outside 001-900 range, note it in comments per Appendix B limitation.
+16. Recognize both English and Russian terminology in shift notes.
+"""
 
     payload = {
         "model": "llama-3.3-70b-versatile",
         "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": prompt},
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": prompt}
         ],
         "response_format": {"type": "json_object"},
+        "temperature": 0.1,  # Low temperature for deterministic extraction
+        "max_tokens": 4000
     }
-    try:
-        response = requests.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            json=payload,
-            headers={"Authorization": f"Bearer {api_key}"},
-            timeout=30,
-        )
-        response.raise_for_status()
-        content = response.json()["choices"][0]["message"]["content"]
-        return json.loads(content)
-    except requests.exceptions.RequestException as exc:
-        st.error(f"Groq API request failed: {exc}")
-    except (KeyError, json.JSONDecodeError) as exc:
-        st.error(f"Groq returned an unexpected response format: {exc}")
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json"
+    }
+
+    for attempt in range(max_retries + 1):
+        try:
+            response = requests.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                json=payload,
+                headers=headers,
+                timeout=60
+            )
+            response.raise_for_status()
+
+            result = response.json()
+            content = result['choices'][0]['message']['content']
+            parsed = json.loads(content)
+            return parsed
+
+        except requests.exceptions.HTTPError as e:
+            if response.status_code == 429 and attempt < max_retries:
+                wait_time = 2 ** attempt
+                st.warning(f"Rate limited. Retrying in {wait_time}s...")
+                time.sleep(wait_time)
+                continue
+            st.error(f"Groq API HTTP Error ({response.status_code}): {str(e)}")
+            return None
+        except json.JSONDecodeError as e:
+            st.error(f"Groq returned invalid JSON: {str(e)}")
+            return None
+        except Exception as e:
+            st.error(f"Groq API call failed: {str(e)}")
+            return None
+
     return None
 
 
-def _rows_as_text(file_bytes: bytes, file_name: str) -> str:
+# =============================================================================
+# FILE PARSING
+# =============================================================================
+
+def extract_text_from_file(file_bytes: bytes, file_name: str) -> str:
     """
-    Converts an uploaded file into readable text for the LLM prompt.
-
-    The previous version called file_bytes.decode('utf-8') on EVERY file,
-    including .xlsx — but .xlsx is a binary zip archive, not text, so that
-    produced garbage input for any Excel upload. This branches by file type
-    and reads .xlsx properly via openpyxl.
+    Extracts text content from CSV, XLSX, or plain text files.
     """
-    if file_name.lower().endswith(".xlsx"):
-        from openpyxl import load_workbook
-        wb = load_workbook(io.BytesIO(file_bytes), read_only=True, data_only=True)
-        lines = []
-        for ws in wb.worksheets:
-            for row in ws.iter_rows(values_only=True):
-                if any(v not in (None, "") for v in row):
-                    lines.append(" | ".join(str(v) for v in row if v is not None))
-        return "\n".join(lines)
-    return file_bytes.decode("utf-8", errors="ignore")
+    file_lower = file_name.lower()
+
+    if file_lower.endswith('.csv'):
+        try:
+            df = pd.read_csv(BytesIO(file_bytes))
+            return df.to_string(index=False)
+        except Exception as e:
+            # Fallback: try as plain text
+            return file_bytes.decode('utf-8', errors='ignore')
+
+    elif file_lower.endswith('.xlsx') or file_lower.endswith('.xls'):
+        try:
+            df = pd.read_excel(BytesIO(file_bytes))
+            return df.to_string(index=False)
+        except Exception as e:
+            st.error(f"Failed to parse Excel file: {str(e)}")
+            return ""
+
+    else:
+        # Plain text
+        return file_bytes.decode('utf-8', errors='ignore')
 
 
-def _chunk_text(text: str, char_limit: int = CHUNK_CHAR_LIMIT) -> list[str]:
-    """Chunks on line boundaries instead of raw character slicing, so a
-    row/record is never split in half across two chunks."""
-    chunks, current, current_len = [], [], 0
-    for line in text.split("\n"):
-        if current_len + len(line) > char_limit and current:
-            chunks.append("\n".join(current))
-            current, current_len = [], 0
-        current.append(line)
-        current_len += len(line) + 1
-    if current:
-        chunks.append("\n".join(current))
-    return chunks or [text]
-
-
-def parse_shift_note(note_text: str) -> dict:
+def smart_chunk_text(text: str, max_chunk_size: int = 15000) -> List[str]:
     """
-    Parses a single free-text shift/field note into one or more staged
-    commissioning records. Unlike process_file_smart, this does NOT save
-    anything — it returns records for the caller to show in a review/confirm
-    UI first, since a shift note is a live human report and worth a quick
-    eyeball before it overwrites registry data.
-
-    Returns: {"records": list[dict], "alerts": list[str]}
+    Chunks text intelligently by trying to preserve record boundaries.
+    Falls back to character-based chunking if no clear boundaries found.
     """
-    if not note_text or not note_text.strip():
-        return {"records": [], "alerts": ["Note is empty."]}
+    # Try to split by double newlines (common record separator)
+    records = text.split('
 
-    data = ask_groq(note_text)
-    if not data:
-        return {"records": [], "alerts": ["The AI parser didn't return a usable response. Try rephrasing the note, or fill it in manually."]}
+')
 
-    records = data.get("records", [data]) if isinstance(data, dict) else data
-    all_alerts = []
+    chunks = []
+    current_chunk = ""
+
     for record in records:
-        record["scope_type"] = record.get("scope_type") or get_kks_scope(record.get("system_kks", ""))
-        all_alerts.extend(enforce_scope_rules(record))
+        if len(current_chunk) + len(record) + 2 > max_chunk_size:
+            if current_chunk:
+                chunks.append(current_chunk.strip())
+            current_chunk = record
+        else:
+            current_chunk += "
 
-    return {"records": records, "alerts": all_alerts}
+" + record if current_chunk else record
+
+    if current_chunk:
+        chunks.append(current_chunk.strip())
+
+    # If any chunk is still too large, force split by single newlines
+    final_chunks = []
+    for chunk in chunks:
+        if len(chunk) > max_chunk_size:
+            lines = chunk.split('
+')
+            current = ""
+            for line in lines:
+                if len(current) + len(line) + 1 > max_chunk_size:
+                    final_chunks.append(current.strip())
+                    current = line
+                else:
+                    current += "
+" + line if current else line
+            if current:
+                final_chunks.append(current.strip())
+        else:
+            final_chunks.append(chunk)
+
+    return final_chunks if final_chunks else [text[:max_chunk_size]]
 
 
-def process_file_smart(file_bytes: bytes, file_name: str) -> dict:
+# =============================================================================
+# KKS POST-PROCESSING VALIDATION
+# =============================================================================
+
+def post_process_kks_record(record: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
     """
-    Incremental processing engine: stores the raw file in Supabase Storage,
-    splits its content into row-safe chunks, skips chunks already processed
-    (by file hash + chunk index) to avoid re-billing the LLM on re-upload,
-    and upserts every extracted record — applying scope/dependency rules
-    to each one.
+    Post-processes an AI-extracted record to enforce Rooppur NPP KKS rules.
+    Validates F0, room codes, A3 codes, and system families with bilingual output.
 
-    Returns a summary dict: {"records_saved": int, "alerts": list[str], "chunks_skipped": int}
+    Returns:
+        (enriched_record, alerts)
     """
-    file_hash = hashlib.md5(file_bytes).hexdigest()
-    storage_path = upload_file_to_storage(file_bytes, file_name)
+    alerts = []
+    kks = record.get("system_kks", "")
 
-    text = _rows_as_text(file_bytes, file_name)
-    chunks = _chunk_text(text)
+    if not kks:
+        alerts.append("WARNING: No KKS code found in extracted record")
+        return record, alerts
 
-    records_saved = 0
-    chunks_skipped = 0
+    kks_upper = kks.upper().strip()
+
+    # Validate F0 (mandatory)
+    if len(kks_upper) >= 1:
+        f0 = kks_upper[0]
+        f0_valid, f0_msg = validate_f0(f0)
+        if not f0_valid:
+            alerts.append(f"KKS F0 ERROR: {f0_msg}")
+        else:
+            alerts.append(f"KKS INFO: {f0_msg}")
+
+    # Validate system family
+    if len(kks_upper) >= 4:
+        f1f2f3 = kks_upper[1:4]
+        family = get_system_family(f1f2f3)
+        family_ru = get_system_family_ru(f1f2f3)
+        if family:
+            alerts.append(f"KKS INFO: System family {f1f2f3[0]} = {family}" + (f" ({family_ru})" if family_ru else ""))
+        elif f1f2f3[:2] in EQUIPMENT_PREFIXES:
+            alerts.append(f"KKS INFO: Equipment prefix {f1f2f3[:2]} recognized")
+        else:
+            alerts.append(
+                f"KKS WARNING: F1F2F3='{f1f2f3}' not in known system prefixes. "
+                f"Verify against Rooppur NPP system index."
+            )
+
+    # Check for room code pattern
+    if "R" in kks_upper[:6]:
+        room_valid, room_msg, room_details = validate_room_code(kks_upper)
+        if room_valid and room_details and room_details.get("is_shaft"):
+            alerts.append(f"KKS INFO: {room_msg}")
+        elif room_valid:
+            alerts.append(f"KKS INFO: Valid room code detected - {room_msg}")
+
+    # Check for A3 codes in longer KKS strings
+    if len(kks_upper) >= 8:
+        for a3_code, a3_data in A3_CODES.items():
+            if a3_code in kks_upper[7:]:
+                alerts.append(f"KKS INFO: A3 code '{a3_code}' detected: {a3_data['en']} ({a3_data['ru']})")
+
+    # Check equipment unit numbering (001-900 per Appendix B)
+    digits = "".join(c for c in kks_upper if c.isdigit())
+    if len(digits) >= 3:
+        potential_an = digits[:3]
+        if potential_an.isdigit():
+            an_val = int(potential_an)
+            if an_val > 900:
+                alerts.append(
+                    f"KKS WARNING: Equipment unit number {an_val} exceeds 900. "
+                    f"Per Appendix B, numbering is 001-900. Verify correctness."
+                )
+            elif an_val == 0:
+                alerts.append(
+                    f"KKS WARNING: Equipment unit number 000 is invalid. "
+                    f"Per Appendix B, numbering starts at 001."
+                )
+
+    return record, alerts
+
+
+# =============================================================================
+# MAIN PROCESSING PIPELINE
+# =============================================================================
+
+def process_file_smart(file_bytes: bytes, file_name: str) -> Tuple[int, List[str]]:
+    """
+    Incremental, idempotent file processing pipeline with Rooppur NPP KKS validation.
+
+    Args:
+        file_bytes: Raw file bytes
+        file_name: Original filename
+
+    Returns:
+        (records_processed, list of all alert messages)
+    """
     all_alerts = []
+    total_processed = 0
+
+    # Compute file hash for idempotency
+    file_hash = hashlib.md5(file_bytes).hexdigest()
+
+    # Extract text
+    raw_text = extract_text_from_file(file_bytes, file_name)
+    if not raw_text.strip():
+        st.error("Could not extract any text from the uploaded file.")
+        return 0, ["ERROR: Empty or unreadable file"]
+
+    # Smart chunking
+    chunks = smart_chunk_text(raw_text)
+    st.info(f"File split into {len(chunks)} chunk(s) for processing.")
+
+    progress_bar = st.progress(0)
+    status_text = st.empty()
 
     for i, chunk in enumerate(chunks):
+        status_text.text(f"Processing chunk {i+1}/{len(chunks)}...")
+
+        # Skip already processed chunks
         if check_chunk_exists(file_hash, i):
-            chunks_skipped += 1
+            st.info(f"Chunk {i+1} already processed (skipping).")
+            progress_bar.progress((i + 1) / len(chunks))
             continue
 
+        # Call AI extraction
         data = ask_groq(chunk)
-        if not data:
-            all_alerts.append(f"⚠️ Chunk {i + 1}/{len(chunks)} failed to parse and was skipped.")
+        if data is None:
+            all_alerts.append(f"ERROR: Failed to process chunk {i+1}")
+            progress_bar.progress((i + 1) / len(chunks))
             continue
 
-        records = data.get("records", [data]) if isinstance(data, dict) else data
+        # Extract records (handle both {records: [...]} and direct dict formats)
+        records = data.get("records", [])
+        if not records and all(k in data for k in ['system', 'system_kks', 'component']):
+            records = [data]
 
+        st.info(f"Chunk {i+1}: Extracted {len(records)} record(s).")
+
+        # Process each record
         for record in records:
-            record["scope_type"] = record.get("scope_type") or get_kks_scope(record.get("system_kks", ""))
-            alerts = enforce_scope_rules(record)
-            all_alerts.extend(alerts)
+            # Post-process KKS validation
+            record, kks_alerts = post_process_kks_record(record)
+            all_alerts.extend(kks_alerts)
 
-            if not record.get("system") or not record.get("component"):
-                continue  # already alerted above; can't upsert without the conflict key
+            # Ensure KKS scope is correct
+            kks = record.get('system_kks', '')
+            scope = get_kks_scope(kks)
 
-            record["source"] = file_name
-            upsert_registry_row(record)
-            records_saved += 1
+            if scope:
+                record['scope_type'] = scope.value
 
+            # Enforce scope milestones and collect alerts
+            record, scope_alerts = enforce_scope_milestones(record)
+            all_alerts.extend(scope_alerts)
+
+            # Check for N/A milestone violations in the source text
+            if scope == ScopeType.EQUIPMENT:
+                for ms in ['pt_status', 'saw_status']:
+                    src_val = record.get(ms, '')
+                    if src_val not in ('N/A', 'Not Applicable', '', 'Pending'):
+                        ms_label_en = MILESTONE_LABELS.get(ms, {}).get("en", ms)
+                        ms_label_ru = MILESTONE_LABELS.get(ms, {}).get("ru", "")
+                        all_alerts.append(
+                            f"ALERT: Source text requested action on '{ms}' ({ms_label_en}"
+                            f"{' / ' + ms_label_ru if ms_label_ru else ''}) for Equipment KKS '{kks}', "
+                            f"but this milestone is N/A for Equipment scope. Value corrected to 'N/A'."
+                        )
+            elif scope == ScopeType.ROOM:
+                for ms in MILESTONES:
+                    src_val = record.get(ms, '')
+                    if src_val not in ('N/A', 'Not Applicable', '', 'Pending'):
+                        ms_label_en = MILESTONE_LABELS.get(ms, {}).get("en", ms)
+                        ms_label_ru = MILESTONE_LABELS.get(ms, {}).get("ru", "")
+                        all_alerts.append(
+                            f"ALERT: Source text requested action on '{ms}' ({ms_label_en}"
+                            f"{' / ' + ms_label_ru if ms_label_ru else ''}) for Room KKS '{kks}', "
+                            f"but room codes do not have commissioning milestones. Value corrected to 'N/A'."
+                        )
+
+            # Validate dependencies
+            dep_issues = validate_milestone_dependencies(record)
+            all_alerts.extend(dep_issues)
+
+            # Upsert to database
+            ok, msgs = upsert_registry_row(record)
+            all_alerts.extend(msgs)
+            if ok:
+                total_processed += 1
+
+        # Mark chunk as done
         mark_chunk_done(file_hash, i)
+        progress_bar.progress((i + 1) / len(chunks))
 
-    if storage_path:
-        record_file_metadata(file_name, storage_path, records_saved)
+    progress_bar.empty()
+    status_text.empty()
 
-    return {"records_saved": records_saved, "alerts": all_alerts, "chunks_skipped": chunks_skipped}
+    return total_processed, all_alerts
+
+
+# =============================================================================
+# NATURAL LANGUAGE SHIFT NOTE PARSER (Direct API)
+# =============================================================================
+
+def parse_shift_notes(notes_text: str) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """
+    Parses natural language shift notes directly into structured records
+    with Rooppur NPP KKS validation and bilingual support.
+
+    Returns:
+        (list of parsed records, list of alerts/warnings)
+    """
+    if not notes_text or not notes_text.strip():
+        return [], ["ERROR: Empty shift notes provided"]
+
+    data = ask_groq(notes_text)
+    if data is None:
+        return [], ["ERROR: AI extraction failed"]
+
+    records = data.get("records", [])
+    if not records and all(k in data for k in ['system', 'system_kks', 'component']):
+        records = [data]
+
+    alerts = []
+    validated_records = []
+
+    for record in records:
+        kks = record.get('system_kks', '')
+
+        # Post-process KKS validation
+        record, kks_alerts = post_process_kks_record(record)
+        alerts.extend(kks_alerts)
+
+        scope = get_kks_scope(kks)
+
+        if scope is None:
+            alerts.append(
+                f"WARNING: Unrecognized KKS '{kks}' in extracted record. "
+                f"Verify F0 prefix is present (mandatory per Rooppur NPP). Manual review required."
+            )
+        else:
+            record['scope_type'] = scope.value
+            record, scope_alerts = enforce_scope_milestones(record)
+            alerts.extend(scope_alerts)
+
+        dep_issues = validate_milestone_dependencies(record)
+        alerts.extend(dep_issues)
+        validated_records.append(record)
+
+    return validated_records, alerts
