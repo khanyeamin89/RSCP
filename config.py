@@ -5,9 +5,6 @@ Contains all constants, schema definitions, and shared utilities.
 
 KKS Coding based on Rooppur NPP document RPR-QM-AEB0001 Revision B05 (2017)
 "Agreement on Using the KKS Coding System" (VGB-B 105 E 2010, VGB-B 106 E 2004)
-
-Bilingual support: Russian (original document language) -> English translations
-for all KKS terminology, system families, and coding elements.
 """
 
 import streamlit as st
@@ -25,7 +22,7 @@ PAGE_TITLE = "Reactor Shop Commissioning Dashboard"
 PAGE_ICON = "⚛️"
 
 # =============================================================================
-# BILINGUAL KKS TAXONOMY DEFINITIONS
+# KKS TAXONOMY DEFINITIONS
 # Rooppur NPP RPR-QM-AEB0001 Rev B05 (2017)
 # =============================================================================
 
@@ -36,7 +33,7 @@ class ScopeType(str, Enum):
     UNKNOWN = "Unknown"
 
 # -----------------------------------------------------------------------------
-# F0 PREFIX (Mandatory per Rooppur agreement) - Bilingual
+# F0 PREFIX (Mandatory per Rooppur agreement)
 # -----------------------------------------------------------------------------
 # F0 is MANDATORY and defines the scope/ownership:
 #   0 = Common station (shared across all units)
@@ -47,159 +44,57 @@ class ScopeType(str, Enum):
 # Special F0 usage per Rooppur:
 #   1 & 2 = Safety train elements (redundancy separation)
 #   0 = Normal operation systems
-#   5 = HVAC from NO diesel-generator
+#   5 = HVAC diesel
 # -----------------------------------------------------------------------------
 
-F0_PREFIXES: Dict[str, Dict[str, str]] = {
-    "0": {
-        "en": "Common station (shared)",
-        "ru": "Общестанционные (общие для всех блоков)",
-    },
-    "1": {
-        "en": "Unit 1 / Safety train elements",
-        "ru": "Блок 1 / Элементы системы безопасности",
-    },
-    "2": {
-        "en": "Unit 2 / Safety train elements",
-        "ru": "Блок 2 / Элементы системы безопасности",
-    },
-    "5": {
-        "en": "HVAC from NO diesel-generator",
-        "ru": "ОВиК от дизель-генератора нормальной эксплуатации",
-    },
-    "9": {
-        "en": "Temporary installations",
-        "ru": "Временные установки",
-    },
+F0_PREFIXES: Dict[str, str] = {
+    "0": "Common station (shared)",
+    "1": "Unit 1 / Safety train elements",
+    "2": "Unit 2 / Safety train elements",
+    "5": "HVAC from NO diesel-generator",
+    "9": "Temporary installations",
 }
 
-F0_SAFETY_TRAINS: Set[str] = {"1", "2"}  # Safety train elements
-F0_NORMAL_OPERATION: Set[str] = {"0"}       # Normal operation
-F0_HVAC_DIESEL: Set[str] = {"5"}            # HVAC from NO diesel-generator
+F0_SAFETY_TRAINS: Set[str] = {"1", "2"}
+F0_NORMAL_OPERATION: Set[str] = {"0"}
+F0_HVAC_DIESEL: Set[str] = {"5"}
 
 # -----------------------------------------------------------------------------
-# F1F2F3 FUNCTIONAL SYSTEM CODES (3 letters) - Bilingual
+# F1F2F3 FUNCTIONAL SYSTEM CODES (3 letters)
 # -----------------------------------------------------------------------------
-# Major system families per Rooppur NPP agreement:
-#   A = Networks / Switchgears
-#   B = Power transmission / Auxiliary supply
-#   C = I&C equipment
-#   E = Fuel / Waste
-#   F = Nuclear fuel handling
-#   G = Water supply / Waste removal
+# Major system families per Rooppur NPP agreement
 # -----------------------------------------------------------------------------
 
-SYSTEM_FAMILY_CODES: Dict[str, Dict[str, str]] = {
-    "A": {
-        "en": "Networks / Switchgears",
-        "ru": "Сети / Распределительные устройства",
-    },
-    "B": {
-        "en": "Power transmission / Auxiliary supply",
-        "ru": "Передача энергии / Вспомогательное питание",
-    },
-    "C": {
-        "en": "I&C equipment",
-        "ru": "Оборудование КИПиА",
-    },
-    "D": {
-        "en": "Diesel generator / Emergency power",
-        "ru": "Дизель-генератор / Аварийное питание",
-    },
-    "E": {
-        "en": "Fuel / Waste",
-        "ru": "Топливо / Отходы",
-    },
-    "F": {
-        "en": "Nuclear fuel handling",
-        "ru": "Обращение с ядерным топливом",
-    },
-    "G": {
-        "en": "Water supply / Waste removal",
-        "ru": "Водоснабжение / Удаление отходов",
-    },
-    "H": {
-        "en": "Heating / Thermal engineering",
-        "ru": "Отопление / Теплотехника",
-    },
-    "I": {
-        "en": "Instrumentation / Internal systems",
-        "ru": "Приборы / Внутренние системы",
-    },
-    "J": {
-        "en": "Process systems (VVER typical)",
-        "ru": "Технологические системы (типичные для ВВЭР)",
-    },
-    "K": {
-        "en": "HVAC / Ventilation",
-        "ru": "ОВиК / Вентиляция",
-    },
-    "L": {
-        "en": "Lifting / Handling equipment",
-        "ru": "Подъемно-транспортное оборудование",
-    },
-    "M": {
-        "en": "Machine shop / Workshop equipment",
-        "ru": "Механический цех / Слесарное оборудование",
-    },
-    "N": {
-        "en": "Nuclear island auxiliary systems",
-        "ru": "Вспомогательные системы ядерного острова",
-    },
-    "O": {
-        "en": "Oil / Lubrication systems",
-        "ru": "Маслосистемы / Смазка",
-    },
-    "P": {
-        "en": "Process auxiliary systems",
-        "ru": "Вспомогательные технологические системы",
-    },
-    "Q": {
-        "en": "Quality assurance / Testing",
-        "ru": "Обеспечение качества / Испытания",
-    },
-    "R": {
-        "en": "Reactor systems",
-        "ru": "Реакторные системы",
-    },
-    "S": {
-        "en": "Safety systems",
-        "ru": "Системы безопасности",
-    },
-    "T": {
-        "en": "Turbine / Steam systems",
-        "ru": "Турбина / Паровые системы",
-    },
-    "U": {
-        "en": "Utilities / General services",
-        "ru": "Коммунальные системы / Общие службы",
-    },
-    "V": {
-        "en": "Vibration / Monitoring",
-        "ru": "Вибрация / Мониторинг",
-    },
-    "W": {
-        "en": "Water treatment / Chemistry",
-        "ru": "Водоподготовка / Химия",
-    },
-    "X": {
-        "en": "Special systems / Spare",
-        "ru": "Специальные системы / Резерв",
-    },
-    "Y": {
-        "en": "Spare / Reserve",
-        "ru": "Резерв",
-    },
-    "Z": {
-        "en": "Spare / Reserve",
-        "ru": "Резерв",
-    },
+SYSTEM_FAMILY_CODES: Dict[str, str] = {
+    "A": "Networks / Switchgears",
+    "B": "Power transmission / Auxiliary supply",
+    "C": "I&C equipment",
+    "D": "Diesel generator / Emergency power",
+    "E": "Fuel / Waste",
+    "F": "Nuclear fuel handling",
+    "G": "Water supply / Waste removal",
+    "H": "Heating / Thermal engineering",
+    "I": "Instrumentation / Internal systems",
+    "J": "Process systems (VVER typical)",
+    "K": "HVAC / Ventilation",
+    "L": "Lifting / Handling equipment",
+    "M": "Machine shop / Workshop equipment",
+    "N": "Nuclear island auxiliary systems",
+    "O": "Oil / Lubrication systems",
+    "P": "Process auxiliary systems",
+    "Q": "Quality assurance / Testing",
+    "R": "Reactor systems",
+    "S": "Safety systems",
+    "T": "Turbine / Steam systems",
+    "U": "Utilities / General services",
+    "V": "Vibration / Monitoring",
+    "W": "Water treatment / Chemistry",
+    "X": "Special systems / Spare",
+    "Y": "Spare / Reserve",
+    "Z": "Spare / Reserve",
 }
 
 # Valid system prefixes (F1F2F3) - All A-Z families per VGB KKS
-# Generated programmatically: 26 families × 26 subsystems × 26 variants = 17,576 codes
-# Covers all possible 3-letter functional system codes
-
 SYSTEM_PREFIXES: Set[str] = set(
     f"{f1}{f2}{f3}"
     for f1 in "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
@@ -208,10 +103,6 @@ SYSTEM_PREFIXES: Set[str] = set(
 )
 
 # Equipment prefixes (2-letter, A1 position in equipment code)
-# Equipment prefixes (2-letter, A1 position in equipment code)
-# All A-Z combinations per VGB KKS Appendix B
-# Covers all possible 2-letter equipment unit codes: 26 × 26 = 676 combinations
-
 EQUIPMENT_PREFIXES: Set[str] = set(
     f"{a1}{a2}"
     for a1 in "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
@@ -219,86 +110,34 @@ EQUIPMENT_PREFIXES: Set[str] = set(
 )
 
 # -----------------------------------------------------------------------------
-# A3 ALPHABETIC CODES (Rooppur NPP specific) - Bilingual
+# A3 ALPHABETIC CODES (Rooppur NPP specific)
 # -----------------------------------------------------------------------------
 # Per RPR-QM-AEB0001 Rev B05, A3 is used for:
-#   - Pulse valves
-#   - Safety valves
-#   - Double drives
-#   - Multiple power supply
-#   - Measurement loops
+#   - Pulse valves, Safety valves, Double drives
+#   - Multiple power supply, Measurement loops
 #   - Electrical phases (A, B, C)
 #   - Lighting subsystems (N=working, E=emergency, F=escape)
 # -----------------------------------------------------------------------------
 
-A3_CODES: Dict[str, Dict[str, str]] = {
-    # Electrical phases
-    "A": {
-        "en": "Electrical phase A",
-        "ru": "Электрическая фаза A",
-    },
-    "B": {
-        "en": "Electrical phase B",
-        "ru": "Электрическая фаза B",
-    },
-    "C": {
-        "en": "Electrical phase C",
-        "ru": "Электрическая фаза C",
-    },
-    # Lighting subsystems
-    "N": {
-        "en": "Lighting - Working (Normal)",
-        "ru": "Освещение - Рабочее (Нормальное)",
-    },
-    "E": {
-        "en": "Lighting - Emergency",
-        "ru": "Освещение - Аварийное",
-    },
-    "F": {
-        "en": "Lighting - Escape route",
-        "ru": "Освещение - Эвакуационное",
-    },
-    # Valve types
-    "P": {
-        "en": "Pulse valve",
-        "ru": "Импульсный клапан",
-    },
-    "S": {
-        "en": "Safety valve",
-        "ru": "Предохранительный клапан",
-    },
-    # Drive types
-    "D": {
-        "en": "Double drive",
-        "ru": "Двойной привод",
-    },
-    # Power supply
-    "M": {
-        "en": "Multiple power supply",
-        "ru": "Множественное питание",
-    },
-    # Measurement loops
-    "L": {
-        "en": "Measurement loop",
-        "ru": "Измерительный контур",
-    },
-    # Additional common codes
-    "X": {
-        "en": "Spare / Reserve",
-        "ru": "Резерв",
-    },
-    "Y": {
-        "en": "Spare / Reserve",
-        "ru": "Резерв",
-    },
-    "Z": {
-        "en": "Spare / Reserve",
-        "ru": "Резерв",
-    },
+A3_CODES: Dict[str, str] = {
+    "A": "Electrical phase A",
+    "B": "Electrical phase B",
+    "C": "Electrical phase C",
+    "N": "Lighting - Working (Normal)",
+    "E": "Lighting - Emergency",
+    "F": "Lighting - Escape route",
+    "P": "Pulse valve",
+    "S": "Safety valve",
+    "D": "Double drive",
+    "M": "Multiple power supply",
+    "L": "Measurement loop",
+    "X": "Spare / Reserve",
+    "Y": "Spare / Reserve",
+    "Z": "Spare / Reserve",
 }
 
 # -----------------------------------------------------------------------------
-# ROOM CODING (Rooppur NPP specific) - Bilingual
+# ROOM CODING (Rooppur NPP specific)
 # -----------------------------------------------------------------------------
 # Room coding uses Cartesian coordinates:
 #   - A1 must contain "R" (Room indicator)
@@ -313,84 +152,49 @@ A3_CODES: Dict[str, Dict[str, str]] = {
 #       9NN = Ventilation shaft
 # -----------------------------------------------------------------------------
 
-ROOM_SHAFT_CODES: Dict[str, Dict[str, str]] = {
-    "3": {
-        "en": "Transport shaft",
-        "ru": "Транспортный шахтный ствол",
-    },
-    "4": {
-        "en": "Cable shaft",
-        "ru": "Кабельный шахтный ствол",
-    },
-    "5": {
-        "en": "Stair shaft",
-        "ru": "Лестничный шахтный ствол",
-    },
-    "6": {
-        "en": "Elevator shaft",
-        "ru": "Лифтовой шахтный ствол",
-    },
-    "7": {
-        "en": "Reactor cavity",
-        "ru": "Реакторный колодец",
-    },
-    "8": {
-        "en": "Process shaft",
-        "ru": "Технологический шахтный ствол",
-    },
-    "9": {
-        "en": "Ventilation shaft",
-        "ru": "Вентиляционный шахтный ствол",
-    },
+ROOM_SHAFT_CODES: Dict[str, str] = {
+    "3": "Transport shaft",
+    "4": "Cable shaft",
+    "5": "Stair shaft",
+    "6": "Elevator shaft",
+    "7": "Reactor cavity",
+    "8": "Process shaft",
+    "9": "Ventilation shaft",
 }
 
 # -----------------------------------------------------------------------------
-# MILESTONE DEFINITIONS - Bilingual
+# MILESTONE DEFINITIONS
+# -----------------------------------------------------------------------------
+# IT, PIC, HT, PT, SAW are COMMISSIONING TESTS performed during the works.
+# They are NOT scope types. All tests apply to all scope types.
 # -----------------------------------------------------------------------------
 
-MILESTONE_LABELS: Dict[str, Dict[str, str]] = {
-    "it_status": {
-        "en": "IT (Individual Test)",
-        "ru": "ИО (Индивидуальные испытания)",
-    },
-    "pic_status": {
-        "en": "PIC (Post-Install Cleaning)",
-        "ru": "ПОМ (Послеустановочная мойка)",
-    },
-    "ht_status": {
-        "en": "HT (Hydro Test)",
-        "ru": "ГИ (Гидравлические испытания)",
-    },
-    "pt_status": {
-        "en": "PT (Pneumatic Test)",
-        "ru": "ПН (Пневматические испытания)",
-    },
-    "saw_status": {
-        "en": "SAW (Start-up & Adjustment)",
-        "ru": "ПНР (Пусконаладочные работы)",
-    },
+MILESTONE_LABELS: Dict[str, str] = {
+    "it_status": "IT (Individual Test)",
+    "pic_status": "PIC (Post-Install Cleaning)",
+    "ht_status": "HT (Hydro Test)",
+    "pt_status": "PT (Pneumatic Test)",
+    "saw_status": "SAW (Start-up & Adjustment)",
 }
 
 MILESTONES: List[str] = ["it_status", "pic_status", "ht_status", "pt_status", "saw_status"]
 
-# Milestones that are N/A for Equipment scope
-EQUIPMENT_NA_MILESTONES: Set[str] = {"pt_status", "saw_status"}
-
-# Valid status values for any milestone - Bilingual
+# Valid status values for any milestone
 VALID_STATUSES: Set[str] = {"Pending", "In Progress", "Completed", "Failed", "N/A", "Not Applicable"}
 
-STATUS_LABELS: Dict[str, Dict[str, str]] = {
-    "Pending": {"en": "Pending", "ru": "В ожидании"},
-    "In Progress": {"en": "In Progress", "ru": "В работе"},
-    "Completed": {"en": "Completed", "ru": "Выполнено"},
-    "Failed": {"en": "Failed", "ru": "Не пройдено"},
-    "N/A": {"en": "N/A", "ru": "Н/П"},
-    "Not Applicable": {"en": "Not Applicable", "ru": "Не применимо"},
+STATUS_LABELS: Dict[str, str] = {
+    "Pending": "Pending",
+    "In Progress": "In Progress",
+    "Completed": "Completed",
+    "Failed": "Failed",
+    "N/A": "N/A",
+    "Not Applicable": "Not Applicable",
 }
 
 # Milestone dependency chain: prerequisite -> dependent
+# PIC must be Completed before HT can be Completed
 MILESTONE_DEPENDENCIES: Dict[str, str] = {
-    "pic_status": "ht_status",   # PIC must be Completed before HT can be Completed
+    "pic_status": "ht_status",
 }
 
 # =============================================================================
@@ -442,36 +246,25 @@ def get_supabase_client():
         st.error(f"Failed to establish Supabase Client core interface: {str(initialization_error)}")
         st.stop()
 
+
 # =============================================================================
-# BILINGUAL HELPER FUNCTIONS
+# HELPER FUNCTIONS
 # =============================================================================
 
-def get_bilingual_label(data_dict: Dict[str, Dict[str, str]], key: str, lang: str = "en") -> str:
-    """Returns a label in the specified language from a bilingual dictionary."""
-    if key in data_dict and lang in data_dict[key]:
-        return data_dict[key][lang]
-    return key
+def get_label(data_dict: Dict[str, str], key: str) -> str:
+    """Returns a label from a dictionary."""
+    return data_dict.get(key, key)
 
 
-def get_bilingual_display(data_dict: Dict[str, Dict[str, str]], key: str) -> str:
-    """Returns a bilingual display string: English (Russian)."""
-    if key in data_dict:
-        en = data_dict[key].get("en", "")
-        ru = data_dict[key].get("ru", "")
-        if en and ru:
-            return f"{en} ({ru})"
-        return en or ru or key
-    return key
+def get_display(data_dict: Dict[str, str], key: str) -> str:
+    """Returns a display string from a dictionary."""
+    return data_dict.get(key, key)
 
 
-def sort_by_russian(data_dict: Dict[str, Dict[str, str]]) -> List[Tuple[str, Dict[str, str]]]:
-    """Sorts a bilingual dictionary by Russian label."""
-    return sorted(data_dict.items(), key=lambda x: x[1].get("ru", x[0]))
+def sort_by_label(data_dict: Dict[str, str]) -> List[Tuple[str, str]]:
+    """Sorts a dictionary by its values (labels)."""
+    return sorted(data_dict.items(), key=lambda x: x[1])
 
-
-def sort_by_english(data_dict: Dict[str, Dict[str, str]]) -> List[Tuple[str, Dict[str, str]]]:
-    """Sorts a bilingual dictionary by English label."""
-    return sorted(data_dict.items(), key=lambda x: x[1].get("en", x[0]))
 
 # =============================================================================
 # KKS VALIDATION ENGINE - Rooppur NPP RPR-QM-AEB0001 Rev B05
@@ -504,7 +297,7 @@ def validate_kks(kks_code: str) -> Tuple[bool, str, Optional[ScopeType]]:
     # Extract F0 (first character) - MANDATORY per Rooppur
     f0 = kks_upper[0]
     if f0 not in F0_PREFIXES:
-        valid_f0s = ", ".join([f"{k}={v['en']}" for k, v in F0_PREFIXES.items()])
+        valid_f0s = ", ".join([f"{k}={v}" for k, v in F0_PREFIXES.items()])
         return False, (
             f"Invalid F0 prefix '{f0}'. "
             f"Valid F0 per Rooppur NPP: {valid_f0s}. "
@@ -533,7 +326,7 @@ def validate_kks(kks_code: str) -> Tuple[bool, str, Optional[ScopeType]]:
     if "R" in kks_upper[:6]:
         return True, f"Potential Room KKS: contains R indicator. Verify 3-digit numbering per Rooppur.", ScopeType.ROOM
 
-    valid_systems = ", ".join([f"{k}={v['en']}" for k, v in SYSTEM_FAMILY_CODES.items()])
+    valid_systems = ", ".join([f"{k}={v}" for k, v in SYSTEM_FAMILY_CODES.items()])
     return (
         False,
         f"Unknown KKS code '{kks_upper}'. "
@@ -553,13 +346,13 @@ def validate_f0(f0: str) -> Tuple[bool, str]:
     if not f0:
         return False, "F0 prefix is MANDATORY per Rooppur NPP RPR-QM-AEB0001 Rev B05"
     if f0 not in F0_PREFIXES:
-        valid_f0s = ", ".join([f"{k}={v['en']}" for k, v in F0_PREFIXES.items()])
+        valid_f0s = ", ".join([f"{k}={v}" for k, v in F0_PREFIXES.items()])
         return False, (
             f"Invalid F0 '{f0}'. Valid: {valid_f0s}. "
             f"F0 defines: 0=common-station, 1/2=units, 9=temporary"
         )
     f0_data = F0_PREFIXES[f0]
-    return True, f"Valid F0={f0}: {f0_data['en']} ({f0_data['ru']})"
+    return True, f"Valid F0={f0}: {f0_data}"
 
 
 def validate_room_code(room_code: str) -> Tuple[bool, str, Optional[Dict[str, Any]]]:
@@ -596,7 +389,6 @@ def validate_room_code(room_code: str) -> Tuple[bool, str, Optional[Dict[str, An
         "digits": digits,
         "is_shaft": False,
         "shaft_type": None,
-        "shaft_type_ru": None,
     }
 
     # Check for special shaft codes (first digit 3-9 with NN pattern)
@@ -605,11 +397,10 @@ def validate_room_code(room_code: str) -> Tuple[bool, str, Optional[Dict[str, An
         if first_digit in ROOM_SHAFT_CODES:
             shaft_data = ROOM_SHAFT_CODES[first_digit]
             details["is_shaft"] = True
-            details["shaft_type"] = shaft_data["en"]
-            details["shaft_type_ru"] = shaft_data["ru"]
+            details["shaft_type"] = shaft_data
             return (
                 True,
-                f"Valid shaft code: {shaft_data['en']} ({shaft_data['ru']}) ({digits})",
+                f"Valid shaft code: {shaft_data} ({digits})",
                 details,
             )
 
@@ -625,11 +416,8 @@ def validate_a3(a3_code: str) -> Tuple[bool, str]:
     Validates A3 alphabetic code per Rooppur NPP specific usage.
 
     A3 is used for:
-      - Pulse valves (P)
-      - Safety valves (S)
-      - Double drives (D)
-      - Multiple power supply (M)
-      - Measurement loops (L)
+      - Pulse valves (P), Safety valves (S), Double drives (D)
+      - Multiple power supply (M), Measurement loops (L)
       - Electrical phases (A, B, C)
       - Lighting subsystems (N=working, E=emergency, F=escape)
 
@@ -643,9 +431,9 @@ def validate_a3(a3_code: str) -> Tuple[bool, str]:
 
     if a3_upper in A3_CODES:
         a3_data = A3_CODES[a3_upper]
-        return True, f"Valid A3 code '{a3_upper}': {a3_data['en']} ({a3_data['ru']})"
+        return True, f"Valid A3 code '{a3_upper}': {a3_data}"
 
-    valid_a3s = ", ".join([f"{k}={v['en']}" for k, v in A3_CODES.items()])
+    valid_a3s = ", ".join([f"{k}={v}" for k, v in A3_CODES.items()])
     return False, (
         f"Unknown A3 code '{a3_upper}'. "
         f"Valid A3 per Rooppur: {valid_a3s}"
@@ -659,88 +447,11 @@ def get_kks_scope(kks_code: str) -> Optional[ScopeType]:
 
 
 def get_system_family(f1f2f3: str) -> Optional[str]:
-    """Returns the English system family description for a given F1F2F3 code."""
+    """Returns the system family description for a given F1F2F3 code."""
     if not f1f2f3 or len(f1f2f3) < 1:
         return None
     first_char = f1f2f3[0].upper()
-    if first_char in SYSTEM_FAMILY_CODES:
-        return SYSTEM_FAMILY_CODES[first_char]["en"]
-    return None
-
-
-def get_system_family_ru(f1f2f3: str) -> Optional[str]:
-    """Returns the Russian system family description for a given F1F2F3 code."""
-    if not f1f2f3 or len(f1f2f3) < 1:
-        return None
-    first_char = f1f2f3[0].upper()
-    if first_char in SYSTEM_FAMILY_CODES:
-        return SYSTEM_FAMILY_CODES[first_char]["ru"]
-    return None
-
-
-def get_bilingual_system_family(f1f2f3: str) -> str:
-    """Returns bilingual system family: English (Russian)."""
-    if not f1f2f3 or len(f1f2f3) < 1:
-        return "Unknown"
-    first_char = f1f2f3[0].upper()
-    if first_char in SYSTEM_FAMILY_CODES:
-        en = SYSTEM_FAMILY_CODES[first_char]["en"]
-        ru = SYSTEM_FAMILY_CODES[first_char]["ru"]
-        return f"{en} ({ru})"
-    return "Unknown"
-
-
-def enforce_scope_milestones(record: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
-    """
-    Enforces milestone rules based on KKS scope per Rooppur NPP.
-    - System: all milestones active
-    - Equipment: PT and SAW set to 'N/A'
-    - Room: all milestones N/A (room coding has no commissioning milestones)
-
-    Returns:
-        (enriched_record, alerts)
-    """
-    alerts = []
-    kks = record.get("system_kks", "")
-    scope = get_kks_scope(kks)
-
-    if scope is None:
-        alerts.append(
-            f"WARNING: Could not determine scope for KKS '{kks}'. "
-            f"Verify F0 prefix is present (mandatory per Rooppur NPP)."
-        )
-        return record, alerts
-
-    record["scope_type"] = scope.value
-
-    if scope == ScopeType.EQUIPMENT:
-        for ms in EQUIPMENT_NA_MILESTONES:
-            current = record.get(ms, "")
-            if current and current not in ("N/A", "Not Applicable", ""):
-                ms_label_en = MILESTONE_LABELS.get(ms, {}).get("en", ms)
-                ms_label_ru = MILESTONE_LABELS.get(ms, {}).get("ru", "")
-                alerts.append(
-                    f"ALERT: KKS '{kks}' (Equipment scope) has non-N/A value '{current}' for '{ms}'. "
-                    f"Auto-corrected to 'N/A'. Equipment does not require {ms_label_en}"
-                    f"{' / ' + ms_label_ru if ms_label_ru else ''}."
-                )
-            record[ms] = "N/A"
-
-    elif scope == ScopeType.ROOM:
-        # Room coding has no commissioning milestones per se
-        for ms in MILESTONES:
-            current = record.get(ms, "")
-            if current and current not in ("N/A", "Not Applicable", ""):
-                ms_label_en = MILESTONE_LABELS.get(ms, {}).get("en", ms)
-                ms_label_ru = MILESTONE_LABELS.get(ms, {}).get("ru", "")
-                alerts.append(
-                    f"ALERT: KKS '{kks}' (Room coding) has milestone value '{current}' for '{ms}'. "
-                    f"Room codes do not have commissioning milestones. Auto-corrected to 'N/A'. "
-                    f"{ms_label_en}{' / ' + ms_label_ru if ms_label_ru else ''}"
-                )
-            record[ms] = "N/A"
-
-    return record, alerts
+    return SYSTEM_FAMILY_CODES.get(first_char)
 
 
 # =============================================================================
@@ -761,18 +472,13 @@ def validate_milestone_dependencies(record: Dict[str, Any]) -> List[str]:
         dependent_val = record.get(dependent, "").strip().lower()
 
         if dependent_val == "completed" and prereq_val != "completed":
-            prereq_label_en = MILESTONE_LABELS.get(prereq, {}).get("en", prereq)
-            prereq_label_ru = MILESTONE_LABELS.get(prereq, {}).get("ru", "")
-            dependent_label_en = MILESTONE_LABELS.get(dependent, {}).get("en", dependent)
-            dependent_label_ru = MILESTONE_LABELS.get(dependent, {}).get("ru", "")
-
-            prereq_full = f"{prereq_label_en}{' / ' + prereq_label_ru if prereq_label_ru else ''}"
-            dependent_full = f"{dependent_label_en}{' / ' + dependent_label_ru if dependent_label_ru else ''}"
+            prereq_label = MILESTONE_LABELS.get(prereq, prereq)
+            dependent_label = MILESTONE_LABELS.get(dependent, dependent)
 
             violations.append(
-                f"DEPENDENCY VIOLATION: '{dependent}' ({dependent_full}) is marked 'Completed' but prerequisite "
-                f"'{prereq}' ({prereq_full}) is '{record.get(prereq, 'N/A')}'. "
-                f"{prereq_label_en} must be Completed before {dependent_label_en}."
+                f"DEPENDENCY VIOLATION: '{dependent}' ({dependent_label}) is marked 'Completed' but prerequisite "
+                f"'{prereq}' ({prereq_label}) is '{record.get(prereq, 'N/A')}'. "
+                f"{prereq_label} must be Completed before {dependent_label}."
             )
 
     return violations
