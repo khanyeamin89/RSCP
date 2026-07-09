@@ -1,188 +1,192 @@
 """
-Reactor Shop Commissioning - Database Operations
-=================================================
-All Supabase interactions with validation, error handling, and transaction safety.
+Database layer — the ONLY place that talks to Supabase.
+config.py and ai_engine.py both import get_supabase_client from here rather
+than creating their own, so the app only ever holds one cached connection.
 """
-
+from datetime import datetime
+import pandas as pd
 import streamlit as st
-from typing import Dict, List, Optional, Any, Tuple
-from postgrest.exceptions import APIError
+from supabase import create_client, Client
 
-# Import from centralized config
-from config import (
-    get_supabase_client,
-    validate_record,
-    enforce_scope_milestones,
-    validate_milestone_dependencies,
-    REGISTRY_SCHEMA,
-    REGISTRY_UNIQUE_KEYS,
-    MILESTONES,
+from config import MILESTONES, BUCKET_NAME
+
+
+@st.cache_resource
+def get_supabase_client() -> Client:
+    """
+    Initializes and caches the connection to the Supabase backend.
+    Fails loudly and stops the app if secrets are missing, rather than
+    letting a cryptic exception surface later.
+    """
+    url = st.secrets.get("SUPABASE_URL")
+    key = st.secrets.get("SUPABASE_KEY")
+
+    if not url or not key:
+        st.error(
+            "CRITICAL ERROR: 'SUPABASE_URL' and 'SUPABASE_KEY' are missing from "
+            "Streamlit Secrets. Application execution halted."
+        )
+        st.stop()
+
+    try:
+        return create_client(url, key)
+    except Exception as init_error:
+        st.error(f"Failed to establish Supabase client: {init_error}")
+        st.stop()
+
+
+REGISTRY_COLUMNS = (
+    ["system", "system_kks", "scope_type", "component", "milestone_id"]
+    + [f"{m}_status" for m in MILESTONES]
+    + ["comments", "source", "last_updated"]
 )
 
+# =============================================================================
+# REGISTRY
+# =============================================================================
+def load_registry() -> pd.DataFrame:
+    """Fetches the full commissioning registry. Was missing entirely before —
+    dashboard.py imported this and would crash on startup without it."""
+    try:
+        res = get_supabase_client().table("registry").select("*").order("system").execute()
+    except Exception as exc:
+        st.error(f"Couldn't load registry from Supabase: {exc}")
+        return pd.DataFrame(columns=REGISTRY_COLUMNS)
+
+    if not res.data:
+        return pd.DataFrame(columns=REGISTRY_COLUMNS)
+
+    df = pd.DataFrame(res.data)
+    for c in REGISTRY_COLUMNS:
+        if c not in df.columns:
+            df[c] = ""
+    return df.fillna("")
+
+
+def upsert_registry_row(row: dict):
+    """UPSERT on (system, component). Stamps last_updated automatically so
+    callers never forget to set it."""
+    payload = dict(row)
+    payload["last_updated"] = datetime.now().isoformat()
+    try:
+        get_supabase_client().table("registry").upsert(payload, on_conflict="system,component").execute()
+    except Exception as exc:
+        st.error(f"Failed to save record to Supabase: {exc}")
+
+
+def delete_registry_row(system: str, component: str):
+    """Deletes a single record identified by its (system, component) key."""
+    try:
+        get_supabase_client().table("registry").delete() \
+            .eq("system", system).eq("component", component).execute()
+    except Exception as exc:
+        st.error(f"Failed to delete record: {exc}")
+
 
 # =============================================================================
-# REGISTRY OPERATIONS
+# TEST LOG
 # =============================================================================
-
-def load_registry() -> List[Dict[str, Any]]:
-    """
-    Loads all records from the registry table.
-    Returns empty list on error (with UI notification).
-    """
+def load_test_log() -> pd.DataFrame:
+    cols = ["timestamp", "system", "component", "test_type", "test_result", "severity", "resolved", "notes"]
     try:
-        supabase = get_supabase_client()
-        response = supabase.table("registry").select("*").execute()
-        return response.data if response.data else []
-    except APIError as e:
-        st.error(f"Database Error loading registry: {e.message}")
-        return []
-    except Exception as e:
-        st.error(f"Unexpected error loading registry: {str(e)}")
-        return []
+        res = get_supabase_client().table("test_log").select("*").order("timestamp", desc=True).execute()
+    except Exception as exc:
+        st.error(f"Couldn't load test log: {exc}")
+        return pd.DataFrame(columns=cols)
+    return pd.DataFrame(res.data) if res.data else pd.DataFrame(columns=cols)
 
 
-def load_registry_df() -> "pd.DataFrame":
-    """Loads registry as a pandas DataFrame for analytics."""
-    import pandas as pd
-    data = load_registry()
-    if not data:
-        return pd.DataFrame(columns=list(REGISTRY_SCHEMA.keys()))
-    return pd.DataFrame(data)
-
-
-def upsert_registry_row(row: Dict[str, Any], skip_validation: bool = False) -> Tuple[bool, List[str]]:
-    """
-    Upserts a single row into the registry table.
-
-    Args:
-        row: The record dictionary to upsert
-        skip_validation: If True, bypasses validation (use with caution)
-
-    Returns:
-        (success: bool, messages: list of info/warning/error strings)
-    """
-    messages = []
-
-    # --- Step 1: Validate record structure ---
-    if not skip_validation:
-        is_valid, issues = validate_record(row)
-        if not is_valid:
-            for issue in issues:
-                messages.append(f"VALIDATION ERROR: {issue}")
-            st.error("Record validation failed. See details below.")
-            for msg in messages:
-                st.markdown(f'<div class="alert-box alert-error">{msg}</div>', unsafe_allow_html=True)
-            return False, messages
-
-    # --- Step 2: Enforce scope-based milestone rules ---
-    row, scope_alerts = enforce_scope_milestones(row)
-    messages.extend(scope_alerts)
-
-    # --- Step 3: Check milestone dependencies ---
-    dep_violations = validate_milestone_dependencies(row)
-    if dep_violations:
-        for v in dep_violations:
-            messages.append(f"DEPENDENCY: {v}")
-        st.warning("Milestone dependency warnings detected. Record will be saved, but review required.")
-        for v in dep_violations:
-            st.markdown(f'<div class="alert-box alert-warning">{v}</div>', unsafe_allow_html=True)
-
-    # --- Step 4: Ensure all schema fields exist (fill missing with defaults) ---
-    clean_row = {}
-    for field, field_type in REGISTRY_SCHEMA.items():
-        val = row.get(field)
-        if val is None:
-            if field_type == str:
-                clean_row[field] = ""
-            else:
-                clean_row[field] = None
-        else:
-            clean_row[field] = str(val) if field_type == str else val
-
-    # --- Step 5: Execute upsert ---
+def insert_test_log_row(row: dict):
     try:
-        supabase = get_supabase_client()
-        result = supabase.table("registry").upsert(
-            clean_row, 
-            on_conflict=",".join(REGISTRY_UNIQUE_KEYS)
-        ).execute()
-
-        messages.append(f"SUCCESS: Record upserted for '{row.get('system', 'Unknown')}' / '{row.get('component', 'Unknown')}'")
-        return True, messages
-
-    except APIError as e:
-        err_msg = f"Database upsert failed: {e.message}"
-        messages.append(f"ERROR: {err_msg}")
-        st.error(err_msg)
-        return False, messages
-    except Exception as e:
-        err_msg = f"Unexpected error during upsert: {str(e)}"
-        messages.append(f"ERROR: {err_msg}")
-        st.error(err_msg)
-        return False, messages
+        get_supabase_client().table("test_log").insert(row).execute()
+    except Exception as exc:
+        st.error(f"Failed to save test log entry: {exc}")
 
 
-def get_registry_row(system: str, component: str) -> Optional[Dict[str, Any]]:
-    """Fetches a single record by system + component composite key."""
+# =============================================================================
+# UPLOADED FILES (Supabase Storage + metadata table)
+# =============================================================================
+def upload_file_to_storage(file_bytes: bytes, file_name: str) -> str | None:
+    storage_path = f"{datetime.now().strftime('%Y%m%d%H%M%S')}_{file_name}"
     try:
-        supabase = get_supabase_client()
-        result = supabase.table("registry")            .select("*")            .eq("system", system)            .eq("component", component)            .execute()
-        return result.data[0] if result.data else None
-    except Exception as e:
-        st.error(f"Error fetching record: {str(e)}")
+        get_supabase_client().storage.from_(BUCKET_NAME).upload(storage_path, file_bytes)
+        return storage_path
+    except Exception as exc:
+        st.warning(f"File was processed but couldn't be saved to Storage: {exc}")
         return None
 
 
-# =============================================================================
-# CHUNK TRACKING (Idempotent Processing)
-# =============================================================================
-
-def check_chunk_exists(file_hash: str, chunk_index: int) -> bool:
-    """Checks if a file chunk has already been processed."""
+def record_file_metadata(file_name: str, storage_path: str, rows_imported: int):
     try:
-        supabase = get_supabase_client()
-        res = supabase.table("processed_chunks")            .select("id", count="exact")            .eq("file_hash", file_hash)            .eq("chunk_index", chunk_index)            .execute()
-        return res.count > 0 if hasattr(res, 'count') else len(res.data) > 0
-    except Exception as e:
-        st.warning(f"Chunk check failed (assuming not processed): {str(e)}")
-        return False
-
-
-def mark_chunk_done(file_hash: str, chunk_index: int) -> bool:
-    """Marks a file chunk as successfully processed."""
-    try:
-        supabase = get_supabase_client()
-        supabase.table("processed_chunks").insert({
-            "file_hash": file_hash,
-            "chunk_index": chunk_index
+        get_supabase_client().table("uploaded_files").insert({
+            "file_name": file_name, "storage_path": storage_path, "rows_imported": rows_imported,
         }).execute()
-        return True
-    except Exception as e:
-        st.warning(f"Failed to mark chunk {chunk_index} as done: {str(e)}")
+    except Exception as exc:
+        st.warning(f"Couldn't record file metadata: {exc}")
+
+
+def load_uploaded_files() -> pd.DataFrame:
+    try:
+        res = get_supabase_client().table("uploaded_files").select("*").order("uploaded_at", desc=True).execute()
+    except Exception:
+        return pd.DataFrame(columns=["file_name", "storage_path", "uploaded_at", "rows_imported"])
+    return pd.DataFrame(res.data) if res.data else pd.DataFrame(
+        columns=["file_name", "storage_path", "uploaded_at", "rows_imported"]
+    )
+
+
+def get_file_download_url(storage_path: str) -> str:
+    try:
+        res = get_supabase_client().storage.from_(BUCKET_NAME).create_signed_url(storage_path, 3600)
+        return res.get("signedURL") or res.get("signed_url", "")
+    except Exception:
+        return ""
+
+
+# =============================================================================
+# KKS GLOSSARY (user-maintained reference — see dashboard.py Tab 5 docstring
+# for why this is editable-by-you rather than pre-filled by the AI)
+# =============================================================================
+def load_kks_glossary() -> pd.DataFrame:
+    cols = ["kks_code", "description", "category", "last_updated"]
+    try:
+        res = get_supabase_client().table("kks_glossary").select("*").order("kks_code").execute()
+    except Exception as exc:
+        st.error(f"Couldn't load KKS glossary: {exc}")
+        return pd.DataFrame(columns=cols)
+    return pd.DataFrame(res.data) if res.data else pd.DataFrame(columns=cols)
+
+
+def upsert_kks_glossary_row(kks_code: str, description: str, category: str):
+    payload = {
+        "kks_code": kks_code.strip().upper(),
+        "description": description,
+        "category": category,
+        "last_updated": datetime.now().isoformat(),
+    }
+    try:
+        get_supabase_client().table("kks_glossary").upsert(payload, on_conflict="kks_code").execute()
+    except Exception as exc:
+        st.error(f"Failed to save glossary entry: {exc}")
+
+
+# =============================================================================
+# CHUNK DEDUP (so re-uploading the same file doesn't re-bill the LLM)
+# =============================================================================
+def check_chunk_exists(file_hash: str, chunk_index: int) -> bool:
+    try:
+        res = get_supabase_client().table("processed_chunks").select("id") \
+            .eq("file_hash", file_hash).eq("chunk_index", chunk_index).execute()
+        return len(res.data) > 0
+    except Exception:
+        # If the check itself fails, don't block processing — fail open.
         return False
 
 
-# =============================================================================
-# BATCH OPERATIONS
-# =============================================================================
-
-def upsert_registry_batch(records: List[Dict[str, Any]]) -> Tuple[int, List[str]]:
-    """
-    Batch upsert with per-record validation and scope enforcement.
-    Returns (success_count, list of all messages).
-    """
-    success_count = 0
-    all_messages = []
-
-    progress = st.progress(0)
-    total = len(records)
-
-    for i, record in enumerate(records):
-        ok, msgs = upsert_registry_row(record)
-        all_messages.extend(msgs)
-        if ok:
-            success_count += 1
-        progress.progress((i + 1) / total)
-
-    progress.empty()
-    return success_count, all_messages
+def mark_chunk_done(file_hash: str, chunk_index: int):
+    try:
+        get_supabase_client().table("processed_chunks").insert(
+            {"file_hash": file_hash, "chunk_index": chunk_index}
+        ).execute()
+    except Exception as exc:
+        st.warning(f"Couldn't record chunk-processed marker: {exc}")
