@@ -3,8 +3,8 @@ Reactor Shop Commissioning - Database Operations
 =================================================
 All Supabase interactions with validation, error handling, and transaction safety.
 
-KKS Coding based on Rooppur NPP document RPR-QM-AEB0001 Revision B05 (2017)
-"Agreement on Using the KKS Coding System" (VGB-B 105 E 2010, VGB-B 106 E 2004)
+KKS Coding based on the Rooppur NPP Reactor Shop KKS Code Master List
+(hard-coded in config.py — see config.py header for source documents).
 """
 
 import streamlit as st
@@ -15,21 +15,12 @@ from postgrest.exceptions import APIError
 from config import (
     get_supabase_client,
     validate_record,
-    validate_kks,
-    validate_f0,
-    validate_room_code,
-    validate_a3,
-    get_kks_scope,
-    get_system_family,
+    parse_kks,
     validate_milestone_dependencies,
     REGISTRY_SCHEMA,
     REGISTRY_UNIQUE_KEYS,
     MILESTONES,
     MILESTONE_LABELS,
-    F0_PREFIXES,
-    A3_CODES,
-    ROOM_SHAFT_CODES,
-    SYSTEM_FAMILY_CODES,
     ScopeType,
 )
 
@@ -74,8 +65,11 @@ def clear_registry() -> Tuple[bool, str]:
     """
     try:
         supabase = get_supabase_client()
-        # Delete all records from registry table
-        result = supabase.table("registry").delete().neq("system", "").execute()
+        # Delete all records. `neq("system", "")` is used instead of an
+        # unconditional delete because Supabase/PostgREST requires a filter
+        # on delete; every row has a non-empty "system" value so this
+        # matches (and removes) all of them.
+        supabase.table("registry").delete().neq("system", "").execute()
         return True, "Registry cleared successfully. All records removed."
     except APIError as e:
         return False, f"Database error clearing registry: {e.message}"
@@ -85,7 +79,7 @@ def clear_registry() -> Tuple[bool, str]:
 
 def upsert_registry_row(row: Dict[str, Any], skip_validation: bool = False) -> Tuple[bool, List[str]]:
     """
-    Upserts a single row into the registry table with Rooppur NPP KKS validation.
+    Upserts a single row into the registry table with real Rooppur NPP KKS validation.
 
     Args:
         row: The record dictionary to upsert
@@ -94,9 +88,9 @@ def upsert_registry_row(row: Dict[str, Any], skip_validation: bool = False) -> T
     Returns:
         (success: bool, messages: list of info/warning/error strings)
     """
-    messages = []
+    messages: List[str] = []
 
-    # --- Step 1: Validate record structure ---
+    # --- Step 1: Validate record structure (required fields, KKS, statuses, deps) ---
     if not skip_validation:
         is_valid, issues = validate_record(row)
         if not is_valid:
@@ -107,40 +101,22 @@ def upsert_registry_row(row: Dict[str, Any], skip_validation: bool = False) -> T
                 st.markdown(f'<div class="alert-box alert-error">{msg}</div>', unsafe_allow_html=True)
             return False, messages
 
-    # --- Step 2: Additional Rooppur NPP KKS validation ---
-    kks = row.get('system_kks', '')
+    # --- Step 2: KKS detail parsing (single source of truth — config.parse_kks) ---
+    kks = row.get("system_kks", "")
     if kks:
-        # Validate F0 (mandatory per Rooppur)
-        if len(kks) >= 1:
-            f0 = kks[0].upper()
-            f0_valid, f0_msg = validate_f0(f0)
-            if not f0_valid:
-                messages.append(f"KKS F0 ERROR: {f0_msg}")
-                st.error(f"KKS F0 ERROR: {f0_msg}")
-                return False, messages
-            else:
-                messages.append(f"KKS INFO: {f0_msg}")
-
-        # Validate system family
-        if len(kks) >= 4:
-            f1f2f3 = kks[1:4].upper()
-            family = get_system_family(f1f2f3)
-            if family:
-                messages.append(f"KKS INFO: System family {f1f2f3[0]} = {family}")
-
-        # Check for room code
-        if 'R' in kks[:6].upper():
-            room_valid, room_msg, _ = validate_room_code(kks)
-            if room_valid:
-                messages.append(f"KKS INFO: {room_msg}")
-
-        # Check for A3 codes
-        if len(kks) >= 8:
-            for a3_code, a3_data in A3_CODES.items():
-                if a3_code in kks[7:].upper():
-                    messages.append(
-                        f"KKS INFO: A3 code '{a3_code}' detected: {a3_data}"
-                    )
+        parsed = parse_kks(kks)
+        if parsed.valid:
+            messages.append(f"KKS INFO: {parsed.message}")
+            for alert in parsed.alerts:
+                messages.append(f"KKS WARNING: {alert}")
+            # Keep scope_type in sync with what was actually parsed.
+            if parsed.scope:
+                row["scope_type"] = parsed.scope.value
+        else:
+            # validate_record() above already caught truly invalid KKS codes
+            # (skip_validation=False path); this branch only matters when
+            # skip_validation=True was requested by the caller.
+            messages.append(f"KKS ERROR: {parsed.message}")
 
     # --- Step 3: Check milestone dependencies ---
     dep_violations = validate_milestone_dependencies(row)
@@ -156,18 +132,15 @@ def upsert_registry_row(row: Dict[str, Any], skip_validation: bool = False) -> T
     for field, field_type in REGISTRY_SCHEMA.items():
         val = row.get(field)
         if val is None:
-            if field_type == str:
-                clean_row[field] = ""
-            else:
-                clean_row[field] = None
+            clean_row[field] = "" if field_type == str else None
         else:
             clean_row[field] = str(val) if field_type == str else val
 
     # --- Step 5: Execute upsert ---
     try:
         supabase = get_supabase_client()
-        result = supabase.table("registry").upsert(
-            clean_row, 
+        supabase.table("registry").upsert(
+            clean_row,
             on_conflict=",".join(REGISTRY_UNIQUE_KEYS)
         ).execute()
 
@@ -206,7 +179,7 @@ def check_chunk_exists(file_hash: str, chunk_index: int) -> bool:
     try:
         supabase = get_supabase_client()
         res = supabase.table("processed_chunks").select("id", count="exact").eq("file_hash", file_hash).eq("chunk_index", chunk_index).execute()
-        return res.count > 0 if hasattr(res, 'count') else len(res.data) > 0
+        return res.count > 0 if hasattr(res, 'count') and res.count is not None else len(res.data) > 0
     except Exception as e:
         st.warning(f"Chunk check failed (assuming not processed): {str(e)}")
         return False
@@ -236,7 +209,10 @@ def upsert_registry_batch(records: List[Dict[str, Any]]) -> Tuple[int, List[str]
     Returns (success_count, list of all messages).
     """
     success_count = 0
-    all_messages = []
+    all_messages: List[str] = []
+
+    if not records:
+        return 0, ["INFO: No records to process."]
 
     progress = st.progress(0)
     total = len(records)
