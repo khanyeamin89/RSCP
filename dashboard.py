@@ -21,11 +21,8 @@ from config import (
     get_supabase_client,
     apply_custom_css,
     validate_kks,
-    validate_f0,
-    validate_room_code,
-    validate_a3,
+    parse_kks,
     get_kks_scope,
-    get_system_family,
     get_label,
     get_display,
     sort_by_label,
@@ -38,10 +35,11 @@ from config import (
     STATUS_LABELS,
     SYSTEM_PREFIXES,
     EQUIPMENT_PREFIXES,
-    F0_PREFIXES,
-    A3_CODES,
-    ROOM_SHAFT_CODES,
-    SYSTEM_FAMILY_CODES,
+    UNIT_CODES,
+    FUNCTION_KEY_LEGEND,
+    EQUIPMENT_TYPE_LEGEND,
+    BUILDING_CODES,
+    SYSTEM_CODES,
     REGISTRY_SCHEMA,
 )
 from database import (
@@ -230,7 +228,7 @@ st.set_page_config(page_title=PAGE_TITLE, page_icon=PAGE_ICON, layout="wide")
 apply_custom_css()
 
 st.markdown("# Reactor Shop Commissioning Management")
-st.markdown("*Rooppur NPP - KKS Coding per RPR-QM-AEB0001 Rev B05 (2017)*")
+st.markdown("*Rooppur NPP - KKS Coding per the Reactor Shop KKS Code Master List*")
 st.markdown("---")
 
 # =============================================================================
@@ -249,9 +247,9 @@ if "selected_rows" not in st.session_state:
 # =============================================================================
 
 with st.sidebar:
-    st.markdown("### KKS Document Reference")
-    st.markdown("**RPR-QM-AEB0001 Rev B05 (2017)**")
-    st.markdown("*Agreement on Using the KKS Coding System*")
+    st.markdown("### KKS Reference")
+    st.markdown("**Reactor Shop KKS Code Master List**")
+    st.markdown("*Compiled from Rooppur NPP Reactor Shop commissioning documents*")
     st.markdown("---")
     st.markdown("### Sort Options")
     sort_by = st.selectbox(
@@ -299,8 +297,8 @@ with tab1:
             st.metric("Equipment Tracked", equip_count)
 
         with col3:
-            room_count = len(df[df['scope_type'] == 'Room']) if 'scope_type' in df.columns else 0
-            st.metric("Rooms Tracked", room_count)
+            building_count = len(df[df['scope_type'] == 'Building']) if 'scope_type' in df.columns else 0
+            st.metric("Buildings Tracked", building_count)
 
         with col4:
             def calc_completion(row):
@@ -374,10 +372,12 @@ with tab1:
         st.subheader("System Family Distribution")
         if 'system_kks' in df.columns:
             def get_family_from_kks(kks):
-                if pd.isna(kks) or not isinstance(kks, str) or len(kks) < 4:
+                if pd.isna(kks) or not isinstance(kks, str):
                     return "Unknown"
-                family_letter = kks[1].upper() if len(kks) > 1 else ""
-                return SYSTEM_FAMILY_CODES.get(family_letter, "Other/Process")
+                result = parse_kks(kks)
+                if not result.valid:
+                    return "Unknown"
+                return result.function_key_desc or result.system_desc or "Other/Process"
 
             df['family'] = df['system_kks'].apply(get_family_from_kks)
             family_counts = df['family'].value_counts().reset_index()
@@ -437,7 +437,7 @@ with tab2:
     st.subheader("Upload & Intelligent Import")
     st.markdown("""
     Upload commissioning registry files (.csv, .xlsx) or raw text.
-    The AI engine will extract structured data, validate KKS codes per Rooppur NPP RPR-QM-AEB0001 Rev B05,
+    The AI engine will extract structured data, validate KKS codes against the Reactor Shop KKS Code Master List,
     and check milestone dependencies before upserting to the database.
     """)
 
@@ -464,7 +464,7 @@ with tab2:
             if alerts:
                 with st.expander(f"Processing Log ({len(alerts)} entries)", expanded=True):
                     for alert in alerts:
-                        if alert.startswith("ERROR") or alert.startswith("KKS ERROR") or alert.startswith("KKS F0 ERROR"):
+                        if alert.startswith("ERROR") or alert.startswith("KKS ERROR"):
                             st.error(alert)
                         elif alert.startswith("ALERT") or alert.startswith("WARNING") or alert.startswith("KKS WARNING"):
                             st.warning(alert)
@@ -482,12 +482,16 @@ with tab2:
 with tab3:
     st.subheader("Manual Record Entry & Edit")
     st.markdown("""
-    Add new records or update existing ones. The form enforces KKS taxonomy per Rooppur NPP RPR-QM-AEB0001 Rev B05,
-    and validates milestone dependencies in real-time.
+    Add new records or update existing ones. The form enforces real KKS taxonomy from the
+    Reactor Shop KKS Code Master List, and validates milestone dependencies in real-time.
 
-    **KKS Structure:** F0 (mandatory) + F1F2F3 + Fn + A1 + An + Bn
-    - F0: 0=common, 1=Unit1, 2=Unit2, 9=temp, 5=HVAC diesel
-    - F1F2F3: A=networks, B=power, C=I&C, E=fuel/waste, F=fuel handling, G=water/waste
+    **KKS Structure** (mandatory 2-digit Unit prefix on every code):
+    - **System:** `Unit(2) + System(2-4 letters)` — e.g. `10JAA`
+    - **Building:** `Unit(2) + U + 2 letters` — e.g. `10UJA`
+    - **Equipment:** `Unit(2) + System(2-4) + Subsystem(2) + Type(2) + Seq(3)` — e.g. `10JAA10BB001`
+
+    See the **KKS Reference** tab for the full list of known Unit, System, Building, and
+    Equipment Type codes.
     """)
 
     # --- Search existing record ---
@@ -529,7 +533,8 @@ with tab3:
             kks_code = st.text_input(
                 "KKS Code *", 
                 value=prefill.get('system_kks', ''),
-                help="F0 (mandatory: 0,1,2,5,9) + F1F2F3 (3 letters). Example: 1JEA10, 0AAA01"
+                help="Unit (2 digits, mandatory) + System (2-4 letters) [+ Subsystem(2) + Type(2) + Seq(3)]. "
+                     "Examples: 10JAA (system), 10UJA (building), 10JAA10BB001 (equipment)"
             )
 
         with col_b:
@@ -554,28 +559,16 @@ with tab3:
                 help=scope_details if scope_details else "Auto-detected from KKS prefix"
             )
 
-        # Show KKS validation details
+        # Show KKS validation details (single source of truth: config.parse_kks)
         if kks_code:
-            valid, msg, scope = validate_kks(kks_code)
-            if valid:
-                st.success(f"{msg}")
-                # Show F0 details
-                f0 = kks_code[0].upper()
-                f0_valid, f0_msg = validate_f0(f0)
-                if f0_valid:
-                    st.info(f"F0 Validation: {f0_msg}")
-                # Show system family
-                if len(kks_code) >= 4:
-                    family = get_system_family(kks_code[1:4])
-                    if family:
-                        st.info(f"System Family: {family}")
-                # Check for room code
-                if 'R' in kks_code[:6].upper():
-                    room_valid, room_msg, _ = validate_room_code(kks_code)
-                    if room_valid:
-                        st.info(f"Room Code: {room_msg}")
+            parsed = parse_kks(kks_code)
+            if parsed.valid:
+                st.success(parsed.message)
+                st.info(f"Unit: {parsed.unit} — {parsed.unit_desc}")
+                for alert in parsed.alerts:
+                    st.warning(alert)
             else:
-                st.error(f"{msg}")
+                st.error(parsed.message)
 
         st.markdown("---")
         st.markdown("#### Commissioning Milestones")
@@ -673,13 +666,13 @@ with tab3:
                     if ok:
                         st.success("Registry Updated Successfully!")
                     for msg in msgs:
-                        if msg.startswith("ALERT") or msg.startswith("WARNING"):
+                        if msg.startswith("ALERT") or msg.startswith("WARNING") or msg.startswith("KKS WARNING"):
                             st.warning(msg)
                         elif msg.startswith("DEPENDENCY"):
                             st.info(msg)
                         elif msg.startswith("KKS INFO"):
                             st.success(msg)
-                        elif msg.startswith("KKS ERROR") or msg.startswith("KKS F0 ERROR"):
+                        elif msg.startswith("KKS ERROR"):
                             st.error(msg)
 
 # =============================================================================
@@ -697,7 +690,7 @@ with tab4:
     notes_text = st.text_area(
         "Shift Notes",
         height=250,
-        placeholder="Example: 1JEA10 feedwater pump AA001 IT completed. PIC in progress due to debris found in strainer. 0JEB20 condensate system HT passed, awaiting SAW scheduling. Room 1R101 cable shaft inspection done."
+        placeholder="Example: 10JAA10AP001 feedwater pump IT completed. PIC in progress due to debris found in strainer. 10JEB20 condensate system HT passed, awaiting SAW scheduling. Building 10UJA lighting inspection done."
     )
 
     parse_label = "Parse & Validate"
@@ -770,8 +763,16 @@ with tab5:
                 key="editor_scope_filter"
             )
         with filter_col2:
+            def _family_for(kks):
+                if not isinstance(kks, str):
+                    return None
+                result = parse_kks(kks)
+                return (result.function_key_desc or result.system_desc) if result.valid else None
+
             if 'system_kks' in df.columns:
-                family_options = sorted(set([get_system_family(kks) for kks in df['system_kks'] if isinstance(kks, str) and len(kks) >= 4]))
+                family_options = sorted(set(
+                    f for f in (_family_for(kks) for kks in df['system_kks']) if f
+                ))
             else:
                 family_options = []
             family_filter = st.multiselect(
@@ -794,9 +795,7 @@ with tab5:
             filtered_df = filtered_df[filtered_df['scope_type'].isin(scope_filter)]
         if family_filter and 'system_kks' in filtered_df.columns:
             def family_matches(kks):
-                if not isinstance(kks, str) or len(kks) < 4:
-                    return False
-                return get_system_family(kks) in family_filter
+                return _family_for(kks) in family_filter
             filtered_df = filtered_df[filtered_df['system_kks'].apply(family_matches)]
         if status_filter:
             mask = False
@@ -1170,67 +1169,62 @@ with tab6:
 
 with tab7:
     st.subheader("Rooppur NPP KKS Coding Reference")
-    st.markdown("*Based on document RPR-QM-AEB0001 Revision B05 (2017)*")
+    st.markdown("*Hard-coded from the Reactor Shop KKS Code Master List (compiled from project commissioning documents)*")
+    st.markdown(
+        "KKS code shapes — **Equipment**: `Unit(2) + System(2-4) + Subsystem(2) + Type(2) + Seq(3)` "
+        "(e.g. `10JAA10BB001`) · **Building**: `Unit(2) + U + 2 letters` (e.g. `10UJA`) · "
+        "**System**: `Unit(2) + System(2-4)` (e.g. `10JAA`)"
+    )
 
     st.markdown("---")
 
-    # F0 Prefixes
-    st.markdown("#### F0 Prefix (Mandatory)")
-    sorted_f0 = sort_by_label(F0_PREFIXES) if sort_by == "label" else sorted(F0_PREFIXES.items())
-
-    f0_data = []
-    for k, v in sorted_f0:
-        f0_data.append({
-            "Prefix": k,
-            "Description": v,
-        })
-    f0_df = pd.DataFrame(f0_data)
-    st.dataframe(f0_df, use_container_width=True, hide_index=True)
+    # Unit Codes
+    st.markdown("#### Unit Codes (mandatory 2-digit prefix)")
+    sorted_units = sort_by_label(UNIT_CODES) if sort_by == "label" else sorted(UNIT_CODES.items())
+    unit_df = pd.DataFrame([{"Unit": k, "Description": v} for k, v in sorted_units])
+    st.dataframe(unit_df, use_container_width=True, hide_index=True)
+    st.caption("Other 2-digit codes (e.g. 05, 11-15, 17) denote auxiliary/shared facility zones.")
 
     st.markdown("---")
 
-    # System Families
-    st.markdown("#### System Families (F1 First Letter)")
-    sorted_families = sort_by_label(SYSTEM_FAMILY_CODES) if sort_by == "label" else sorted(SYSTEM_FAMILY_CODES.items())
-
-    family_data = []
-    for k, v in sorted_families:
-        family_data.append({
-            "Family Code": k,
-            "Description": v,
-        })
-    family_df = pd.DataFrame(family_data)
-    st.dataframe(family_df, use_container_width=True, hide_index=True)
+    # Function Key Legend
+    st.markdown("#### Function Key Legend (1st letter of System code)")
+    sorted_fkeys = sort_by_label(FUNCTION_KEY_LEGEND) if sort_by == "label" else sorted(FUNCTION_KEY_LEGEND.items())
+    fkey_df = pd.DataFrame([{"Function Key": k, "Description": v} for k, v in sorted_fkeys])
+    st.dataframe(fkey_df, use_container_width=True, hide_index=True)
 
     st.markdown("---")
 
-    # A3 Codes
-    st.markdown("#### A3 Alphabetic Codes")
-    sorted_a3 = sort_by_label(A3_CODES) if sort_by == "label" else sorted(A3_CODES.items())
-
-    a3_data = []
-    for k, v in sorted_a3:
-        a3_data.append({
-            "Code": k,
-            "Description": v,
-        })
-    a3_df = pd.DataFrame(a3_data)
-    st.dataframe(a3_df, use_container_width=True, hide_index=True)
+    # Equipment Type Legend
+    st.markdown("#### Equipment Type Legend (2-letter type code)")
+    sorted_types = sort_by_label(EQUIPMENT_TYPE_LEGEND) if sort_by == "label" else sorted(EQUIPMENT_TYPE_LEGEND.items())
+    type_df = pd.DataFrame([{"Type Code": k, "Description": v} for k, v in sorted_types])
+    st.dataframe(type_df, use_container_width=True, hide_index=True)
 
     st.markdown("---")
 
-    # Room Shaft Codes
-    st.markdown("#### Room Shaft Codes (Special)")
-    sorted_shafts = sort_by_label(ROOM_SHAFT_CODES) if sort_by == "label" else sorted(ROOM_SHAFT_CODES.items())
+    # System Codes (searchable — 439 known codes)
+    st.markdown(f"#### Known System Codes ({len(SYSTEM_CODES)})")
+    sys_search = st.text_input("Filter system codes", key="sys_code_search", placeholder="e.g. JAA, cooling, pump")
+    sorted_systems = sort_by_label({k: v[0] for k, v in SYSTEM_CODES.items()}) if sort_by == "label" else sorted(SYSTEM_CODES.items())
+    sys_rows = [{"System Code": k, "Description": (v[0] if isinstance(v, tuple) else v), "Function Key": (v[1] if isinstance(v, tuple) else SYSTEM_CODES.get(k, ("", ""))[1])} for k, v in (sorted_systems if sort_by == "label" else SYSTEM_CODES.items())]
+    sys_df = pd.DataFrame(sys_rows)
+    if sys_search:
+        mask = sys_df["System Code"].str.contains(sys_search, case=False, na=False) | sys_df["Description"].str.contains(sys_search, case=False, na=False)
+        sys_df = sys_df[mask]
+    st.dataframe(sys_df, use_container_width=True, hide_index=True, height=300)
 
-    shaft_data = []
-    for k, v in sorted_shafts:
-        shaft_data.append({
-            "Code": k + "NN",
-            "Description": v,
-        })
-    shaft_df = pd.DataFrame(shaft_data)
-    st.dataframe(shaft_df, use_container_width=True, hide_index=True)
+    st.markdown("---")
+
+    # Building Codes (searchable — 257 known codes)
+    st.markdown(f"#### Known Building Codes ({len(BUILDING_CODES)})")
+    bld_search = st.text_input("Filter building codes", key="bld_code_search", placeholder="e.g. 10UJA, ventilation")
+    sorted_buildings = sort_by_label(BUILDING_CODES) if sort_by == "label" else sorted(BUILDING_CODES.items())
+    bld_df = pd.DataFrame([{"Building Code": k, "Description": v} for k, v in sorted_buildings])
+    if bld_search:
+        mask = bld_df["Building Code"].str.contains(bld_search, case=False, na=False) | bld_df["Description"].str.contains(bld_search, case=False, na=False)
+        bld_df = bld_df[mask]
+    st.dataframe(bld_df, use_container_width=True, hide_index=True, height=300)
 
     st.markdown("---")
 
@@ -1266,32 +1260,36 @@ with tab7:
     st.markdown("#### KKS Code Structure")
     st.markdown("""
     ```
-    F0 + F1F2F3 + Fn + A1 + An + Bn
+    Unit(2 digits, MANDATORY) + one of:
 
-    F0  = Prefix (MANDATORY)
-          0 = Common station
-          1 = Unit 1 / Safety train
-          2 = Unit 2 / Safety train
-          5 = HVAC from NO diesel-generator
-          9 = Temporary installations
+    SYSTEM     Unit + System(2-4 letters)
+               e.g. 10JAA
 
-    F1F2F3 = Functional system (3 letters)
-             A = Networks/Switchgears
-             B = Power transmission/Auxiliary supply
-             C = I&C equipment
-             E = Fuel/Waste
-             F = Nuclear fuel handling
-             G = Water supply/Waste removal
+    BUILDING   Unit + "U" + 2 letters
+               e.g. 10UJA
 
-    Fn  = 00-99
-    A1  = Equipment unit letter
-    An  = 001-999 (per Appendix B)
-    Bn  = 01-99 component
+    EQUIPMENT  Unit + System(2-4) + Subsystem(2 digits)
+                    + Type(2 letters) + Sequence(3 digits)
+               e.g. 10JAA10BB001
+                    │  │   │  │  └─ Sequence 001
+                    │  │   │  └──── Type BB (vessel/tank)
+                    │  │   └─────── Subsystem 10
+                    │  └─────────── System JAA
+                    └────────────── Unit 10 (Unit 1)
     ```
+
+    Unit, System, Building, and Equipment Type codes are validated against the
+    hard-coded Reactor Shop KKS Code Master List (see the tables above). A code that
+    matches the structural shape but isn't yet in the master list is still accepted —
+    it's flagged as a warning for manual verification rather than rejected outright,
+    since legitimately new equipment appears in the field before any master list is updated.
     """)
 
     st.markdown("---")
-    st.markdown("**Limitation:** Equipment unit numbering validation (001-900) requires Appendix B which is not fully detailed in the provided context. Codes outside this range will generate warnings.")
+    st.markdown(
+        "**Note:** Sequence numbers of `000` are flagged as invalid (numbering starts at 001); "
+        "unrecognized system or equipment-type codes are flagged as warnings, not hard errors."
+    )
 
 # =============================================================================
 # TAB 8: ADMIN - REGISTRY CLEAN
