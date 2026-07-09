@@ -214,9 +214,7 @@ def smart_chunk_text(text: str, max_chunk_size: int = 15000) -> List[str]:
                 chunks.append(current_chunk.strip())
             current_chunk = record
         else:
-            current_chunk += "
-
-" + record if current_chunk else record
+            current_chunk += "\n\n" + record if current_chunk else record
 
     if current_chunk:
         chunks.append(current_chunk.strip())
@@ -225,16 +223,14 @@ def smart_chunk_text(text: str, max_chunk_size: int = 15000) -> List[str]:
     final_chunks = []
     for chunk in chunks:
         if len(chunk) > max_chunk_size:
-            lines = chunk.split('
-')
+            lines = chunk.split('\n')
             current = ""
             for line in lines:
                 if len(current) + len(line) + 1 > max_chunk_size:
                     final_chunks.append(current.strip())
                     current = line
                 else:
-                    current += "
-" + line if current else line
+                    current += "\n" + line if current else line
             if current:
                 final_chunks.append(current.strip())
         else:
