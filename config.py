@@ -1,640 +1,872 @@
 """
-Reactor Shop Commissioning - Main Dashboard
-============================================
-Interactive Streamlit application for commissioning registry management.
-Uses native Streamlit charts to avoid external dependencies.
+Reactor Shop Commissioning - Centralized Configuration
+======================================================
+Contains all constants, schema definitions, and shared utilities.
 
 KKS Coding based on Rooppur NPP document RPR-QM-AEB0001 Revision B05 (2017)
 "Agreement on Using the KKS Coding System" (VGB-B 105 E 2010, VGB-B 106 E 2004)
+
+Bilingual support: Russian (original document language) -> English translations
+for all KKS terminology, system families, and coding elements.
 """
 
 import streamlit as st
-import pandas as pd
-from typing import Dict, Any, List
+from supabase import create_client
+from functools import lru_cache
+from typing import Dict, List, Set, Tuple, Optional, Any
+from dataclasses import dataclass
+from enum import Enum
 
-# Import centralized config and database modules
-from config import (
-    PAGE_TITLE,
-    PAGE_ICON,
-    get_supabase_client,
-    apply_custom_css,
-    validate_kks,
-    validate_f0,
-    validate_room_code,
-    validate_a3,
-    get_kks_scope,
-    get_system_family,
-    enforce_scope_milestones,
-    validate_milestone_dependencies,
-    validate_record,
-    ScopeType,
-    MILESTONES,
-    VALID_STATUSES,
-    SYSTEM_PREFIXES,
-    EQUIPMENT_PREFIXES,
-    F0_PREFIXES,
-    A3_CODES,
-    ROOM_SHAFT_CODES,
-    SYSTEM_FAMILY_CODES,
-    REGISTRY_SCHEMA,
+# =============================================================================
+# PAGE CONFIGURATION
+# =============================================================================
+
+PAGE_TITLE = "Reactor Shop Commissioning Dashboard"
+PAGE_ICON = "⚛️"
+
+# =============================================================================
+# BILINGUAL KKS TAXONOMY DEFINITIONS
+# Rooppur NPP RPR-QM-AEB0001 Rev B05 (2017)
+# =============================================================================
+
+class ScopeType(str, Enum):
+    SYSTEM = "System"
+    EQUIPMENT = "Equipment"
+    ROOM = "Room"
+    UNKNOWN = "Unknown"
+
+# -----------------------------------------------------------------------------
+# F0 PREFIX (Mandatory per Rooppur agreement) - Bilingual
+# -----------------------------------------------------------------------------
+# F0 is MANDATORY and defines the scope/ownership:
+#   0 = Common station (shared across all units)
+#   1 = Unit 1
+#   2 = Unit 2
+#   9 = Temporary installations
+#
+# Special F0 usage per Rooppur:
+#   1 & 2 = Safety train elements (redundancy separation)
+#   0 = Normal operation systems
+#   5 = HVAC from NO diesel-generator
+# -----------------------------------------------------------------------------
+
+F0_PREFIXES: Dict[str, Dict[str, str]] = {
+    "0": {
+        "en": "Common station (shared)",
+        "ru": "Общестанционные (общие для всех блоков)",
+    },
+    "1": {
+        "en": "Unit 1 / Safety train elements",
+        "ru": "Блок 1 / Элементы системы безопасности",
+    },
+    "2": {
+        "en": "Unit 2 / Safety train elements",
+        "ru": "Блок 2 / Элементы системы безопасности",
+    },
+    "5": {
+        "en": "HVAC from NO diesel-generator",
+        "ru": "ОВиК от дизель-генератора нормальной эксплуатации",
+    },
+    "9": {
+        "en": "Temporary installations",
+        "ru": "Временные установки",
+    },
+}
+
+F0_SAFETY_TRAINS: Set[str] = {"1", "2"}  # Safety train elements
+F0_NORMAL_OPERATION: Set[str] = {"0"}       # Normal operation
+F0_HVAC_DIESEL: Set[str] = {"5"}            # HVAC from NO diesel-generator
+
+# -----------------------------------------------------------------------------
+# F1F2F3 FUNCTIONAL SYSTEM CODES (3 letters) - Bilingual
+# -----------------------------------------------------------------------------
+# Major system families per Rooppur NPP agreement:
+#   A = Networks / Switchgears
+#   B = Power transmission / Auxiliary supply
+#   C = I&C equipment
+#   E = Fuel / Waste
+#   F = Nuclear fuel handling
+#   G = Water supply / Waste removal
+# -----------------------------------------------------------------------------
+
+SYSTEM_FAMILY_CODES: Dict[str, Dict[str, str]] = {
+    "A": {
+        "en": "Networks / Switchgears",
+        "ru": "Сети / Распределительные устройства",
+    },
+    "B": {
+        "en": "Power transmission / Auxiliary supply",
+        "ru": "Передача энергии / Вспомогательное питание",
+    },
+    "C": {
+        "en": "I&C equipment",
+        "ru": "Оборудование КИПиА",
+    },
+    "D": {
+        "en": "Diesel generator / Emergency power",
+        "ru": "Дизель-генератор / Аварийное питание",
+    },
+    "E": {
+        "en": "Fuel / Waste",
+        "ru": "Топливо / Отходы",
+    },
+    "F": {
+        "en": "Nuclear fuel handling",
+        "ru": "Обращение с ядерным топливом",
+    },
+    "G": {
+        "en": "Water supply / Waste removal",
+        "ru": "Водоснабжение / Удаление отходов",
+    },
+    "H": {
+        "en": "Heating / Thermal engineering",
+        "ru": "Отопление / Теплотехника",
+    },
+    "I": {
+        "en": "Instrumentation / Internal systems",
+        "ru": "Приборы / Внутренние системы",
+    },
+    "J": {
+        "en": "Process systems (VVER typical)",
+        "ru": "Технологические системы (типичные для ВВЭР)",
+    },
+    "K": {
+        "en": "HVAC / Ventilation",
+        "ru": "ОВиК / Вентиляция",
+    },
+    "L": {
+        "en": "Lifting / Handling equipment",
+        "ru": "Подъемно-транспортное оборудование",
+    },
+    "M": {
+        "en": "Machine shop / Workshop equipment",
+        "ru": "Механический цех / Слесарное оборудование",
+    },
+    "N": {
+        "en": "Nuclear island auxiliary systems",
+        "ru": "Вспомогательные системы ядерного острова",
+    },
+    "O": {
+        "en": "Oil / Lubrication systems",
+        "ru": "Маслосистемы / Смазка",
+    },
+    "P": {
+        "en": "Process auxiliary systems",
+        "ru": "Вспомогательные технологические системы",
+    },
+    "Q": {
+        "en": "Quality assurance / Testing",
+        "ru": "Обеспечение качества / Испытания",
+    },
+    "R": {
+        "en": "Reactor systems",
+        "ru": "Реакторные системы",
+    },
+    "S": {
+        "en": "Safety systems",
+        "ru": "Системы безопасности",
+    },
+    "T": {
+        "en": "Turbine / Steam systems",
+        "ru": "Турбина / Паровые системы",
+    },
+    "U": {
+        "en": "Utilities / General services",
+        "ru": "Коммунальные системы / Общие службы",
+    },
+    "V": {
+        "en": "Vibration / Monitoring",
+        "ru": "Вибрация / Мониторинг",
+    },
+    "W": {
+        "en": "Water treatment / Chemistry",
+        "ru": "Водоподготовка / Химия",
+    },
+    "X": {
+        "en": "Special systems / Spare",
+        "ru": "Специальные системы / Резерв",
+    },
+    "Y": {
+        "en": "Spare / Reserve",
+        "ru": "Резерв",
+    },
+    "Z": {
+        "en": "Spare / Reserve",
+        "ru": "Резерв",
+    },
+}}
+
+# Valid system prefixes (F1F2F3) - All A-Z families per VGB KKS
+# Generated programmatically: 26 families × 26 subsystems × 26 variants = 17,576 codes
+# Covers all possible 3-letter functional system codes
+
+SYSTEM_PREFIXES: Set[str] = set(
+    f"{f1}{f2}{f3}"
+    for f1 in "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    for f2 in "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    for f3 in "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 )
-from database import (
-    load_registry,
-    load_registry_df,
-    upsert_registry_row,
-    get_registry_row,
-    upsert_registry_batch,
+
+# Equipment prefixes (2-letter, A1 position in equipment code)
+# Equipment prefixes (2-letter, A1 position in equipment code)
+# All A-Z combinations per VGB KKS Appendix B
+# Covers all possible 2-letter equipment unit codes: 26 × 26 = 676 combinations
+
+EQUIPMENT_PREFIXES: Set[str] = set(
+    f"{a1}{a2}"
+    for a1 in "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    for a2 in "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 )
-from ai_engine import process_file_smart, parse_shift_notes
+
+# -----------------------------------------------------------------------------
+# A3 ALPHABETIC CODES (Rooppur NPP specific) - Bilingual
+# -----------------------------------------------------------------------------
+# Per RPR-QM-AEB0001 Rev B05, A3 is used for:
+#   - Pulse valves
+#   - Safety valves
+#   - Double drives
+#   - Multiple power supply
+#   - Measurement loops
+#   - Electrical phases (A, B, C)
+#   - Lighting subsystems (N=working, E=emergency, F=escape)
+# -----------------------------------------------------------------------------
+
+A3_CODES: Dict[str, Dict[str, str]] = {
+    # Electrical phases
+    "A": {
+        "en": "Electrical phase A",
+        "ru": "Электрическая фаза A",
+    },
+    "B": {
+        "en": "Electrical phase B",
+        "ru": "Электрическая фаза B",
+    },
+    "C": {
+        "en": "Electrical phase C",
+        "ru": "Электрическая фаза C",
+    },
+    # Lighting subsystems
+    "N": {
+        "en": "Lighting - Working (Normal)",
+        "ru": "Освещение - Рабочее (Нормальное)",
+    },
+    "E": {
+        "en": "Lighting - Emergency",
+        "ru": "Освещение - Аварийное",
+    },
+    "F": {
+        "en": "Lighting - Escape route",
+        "ru": "Освещение - Эвакуационное",
+    },
+    # Valve types
+    "P": {
+        "en": "Pulse valve",
+        "ru": "Импульсный клапан",
+    },
+    "S": {
+        "en": "Safety valve",
+        "ru": "Предохранительный клапан",
+    },
+    # Drive types
+    "D": {
+        "en": "Double drive",
+        "ru": "Двойной привод",
+    },
+    # Power supply
+    "M": {
+        "en": "Multiple power supply",
+        "ru": "Множественное питание",
+    },
+    # Measurement loops
+    "L": {
+        "en": "Measurement loop",
+        "ru": "Измерительный контур",
+    },
+    # Additional common codes
+    "X": {
+        "en": "Spare / Reserve",
+        "ru": "Резерв",
+    },
+    "Y": {
+        "en": "Spare / Reserve",
+        "ru": "Резерв",
+    },
+    "Z": {
+        "en": "Spare / Reserve",
+        "ru": "Резерв",
+    },
+}
+
+# -----------------------------------------------------------------------------
+# ROOM CODING (Rooppur NPP specific) - Bilingual
+# -----------------------------------------------------------------------------
+# Room coding uses Cartesian coordinates:
+#   - A1 must contain "R" (Room indicator)
+#   - 3-digit numbering
+#   - Special shaft codes:
+#       3NN = Transport shaft
+#       4NN = Cable shaft
+#       5NN = Stair shaft
+#       6NN = Elevator shaft
+#       7NN = Reactor cavity
+#       8NN = Process shaft
+#       9NN = Ventilation shaft
+# -----------------------------------------------------------------------------
+
+ROOM_SHAFT_CODES: Dict[str, Dict[str, str]] = {
+    "3": {
+        "en": "Transport shaft",
+        "ru": "Транспортный шахтный ствол",
+    },
+    "4": {
+        "en": "Cable shaft",
+        "ru": "Кабельный шахтный ствол",
+    },
+    "5": {
+        "en": "Stair shaft",
+        "ru": "Лестничный шахтный ствол",
+    },
+    "6": {
+        "en": "Elevator shaft",
+        "ru": "Лифтовой шахтный ствол",
+    },
+    "7": {
+        "en": "Reactor cavity",
+        "ru": "Реакторный колодец",
+    },
+    "8": {
+        "en": "Process shaft",
+        "ru": "Технологический шахтный ствол",
+    },
+    "9": {
+        "en": "Ventilation shaft",
+        "ru": "Вентиляционный шахтный ствол",
+    },
+}
+
+# -----------------------------------------------------------------------------
+# MILESTONE DEFINITIONS - Bilingual
+# -----------------------------------------------------------------------------
+
+MILESTONE_LABELS: Dict[str, Dict[str, str]] = {
+    "it_status": {
+        "en": "IT (Individual Test)",
+        "ru": "ИО (Индивидуальные испытания)",
+    },
+    "pic_status": {
+        "en": "PIC (Post-Install Cleaning)",
+        "ru": "ПОМ (Послеустановочная мойка)",
+    },
+    "ht_status": {
+        "en": "HT (Hydro Test)",
+        "ru": "ГИ (Гидравлические испытания)",
+    },
+    "pt_status": {
+        "en": "PT (Pneumatic Test)",
+        "ru": "ПН (Пневматические испытания)",
+    },
+    "saw_status": {
+        "en": "SAW (Start-up & Adjustment)",
+        "ru": "ПНР (Пусконаладочные работы)",
+    },
+}
+
+MILESTONES: List[str] = ["it_status", "pic_status", "ht_status", "pt_status", "saw_status"]
+
+# Milestones that are N/A for Equipment scope
+EQUIPMENT_NA_MILESTONES: Set[str] = {"pt_status", "saw_status"}
+
+# Valid status values for any milestone - Bilingual
+VALID_STATUSES: Set[str] = {"Pending", "In Progress", "Completed", "Failed", "N/A", "Not Applicable"}
+
+STATUS_LABELS: Dict[str, Dict[str, str]] = {
+    "Pending": {"en": "Pending", "ru": "В ожидании"},
+    "In Progress": {"en": "In Progress", "ru": "В работе"},
+    "Completed": {"en": "Completed", "ru": "Выполнено"},
+    "Failed": {"en": "Failed", "ru": "Не пройдено"},
+    "N/A": {"en": "N/A", "ru": "Н/П"},
+    "Not Applicable": {"en": "Not Applicable", "ru": "Не применимо"},
+}
+
+# Milestone dependency chain: prerequisite -> dependent
+MILESTONE_DEPENDENCIES: Dict[str, str] = {
+    "pic_status": "ht_status",   # PIC must be Completed before HT can be Completed
+}
 
 # =============================================================================
-# PAGE SETUP
+# DATABASE SCHEMA (Registry Table)
 # =============================================================================
 
-st.set_page_config(page_title=PAGE_TITLE, page_icon=PAGE_ICON, layout="wide")
-apply_custom_css()
+REGISTRY_SCHEMA: Dict[str, type] = {
+    "system": str,
+    "system_kks": str,
+    "scope_type": str,
+    "component": str,
+    "it_status": str,
+    "pic_status": str,
+    "ht_status": str,
+    "pt_status": str,
+    "saw_status": str,
+    "comments": str,
+}
 
-st.markdown("# ⚛️ Reactor Shop Commissioning Management")
-st.markdown("*Rooppur NPP - KKS Coding per RPR-QM-AEB0001 Rev B05 (2017)*")
-st.markdown("---")
-
-# =============================================================================
-# TABS
-# =============================================================================
-
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
-    "📊 Analytics Dashboard", 
-    "📥 Data Import & Sync", 
-    "🛠️ Manual/Field Updates",
-    "📝 Shift Note Parser",
-    "📖 KKS Reference"
-])
+REGISTRY_REQUIRED_FIELDS: Set[str] = {"system", "component", "system_kks"}
+REGISTRY_UNIQUE_KEYS: List[str] = ["system", "component"]
 
 # =============================================================================
-# TAB 1: ANALYTICS DASHBOARD
+# SUPABASE CLIENT (Single Source of Truth)
 # =============================================================================
 
-with tab1:
-    df = load_registry_df()
+@st.cache_resource(show_spinner=False)
+def get_supabase_client():
+    """
+    Initializes and caches the connection to the Supabase backend.
+    Enforces strict verification of environment variables before allowing execution.
+    """
+    url = st.secrets.get("SUPABASE_URL")
+    key = st.secrets.get("SUPABASE_KEY")
 
-    if df.empty:
-        st.info("No data in registry yet. Use the Import or Manual tabs to add records.")
-    else:
-        # --- Top Metrics Row ---
-        col1, col2, col3, col4, col5 = st.columns(5)
+    if not url or not key:
+        st.error(
+            "CRITICAL ERROR: Supabase connection parameters ('SUPABASE_URL' and 'SUPABASE_KEY') "
+            "are missing from the Streamlit Secrets environment. Application execution halted."
+        )
+        st.stop()
 
-        with col1:
-            system_count = len(df[df['scope_type'] == 'System']) if 'scope_type' in df.columns else 0
-            st.metric("Systems Tracked", system_count)
+    try:
+        client = create_client(url, key)
+        # Verify connection with a lightweight ping
+        client.table("registry").select("count", count="exact").limit(0).execute()
+        return client
+    except Exception as initialization_error:
+        st.error(f"Failed to establish Supabase Client core interface: {str(initialization_error)}")
+        st.stop()
 
-        with col2:
-            equip_count = len(df[df['scope_type'] == 'Equipment']) if 'scope_type' in df.columns else 0
-            st.metric("Equipment Tracked", equip_count)
+# =============================================================================
+# BILINGUAL HELPER FUNCTIONS
+# =============================================================================
 
-        with col3:
-            room_count = len(df[df['scope_type'] == 'Room']) if 'scope_type' in df.columns else 0
-            st.metric("Rooms Tracked", room_count)
+def get_bilingual_label(data_dict: Dict[str, Dict[str, str]], key: str, lang: str = "en") -> str:
+    """Returns a label in the specified language from a bilingual dictionary."""
+    if key in data_dict and lang in data_dict[key]:
+        return data_dict[key][lang]
+    return key
 
-        with col4:
-            # Overall completion: count records where ALL applicable milestones are Completed
-            def calc_completion(row):
-                applicable = []
-                scope = row.get('scope_type', '')
-                for ms in MILESTONES:
-                    val = str(row.get(ms, '')).strip()
-                    if scope == 'Equipment' and ms in ('pt_status', 'saw_status'):
-                        continue  # Skip N/A milestones for equipment
-                    if scope == 'Room':
-                        continue  # Skip all milestones for room codes
-                    applicable.append(val.lower() == 'completed')
-                return all(applicable) if applicable else False
 
-            completed = df.apply(calc_completion, axis=1).sum()
-            total = len(df)
-            overall_pct = (completed / total * 100) if total > 0 else 0
-            st.metric("Fully Completed", f"{completed}/{total}", f"{overall_pct:.1f}%")
+def get_bilingual_display(data_dict: Dict[str, Dict[str, str]], key: str) -> str:
+    """Returns a bilingual display string: English (Russian)."""
+    if key in data_dict:
+        en = data_dict[key].get("en", "")
+        ru = data_dict[key].get("ru", "")
+        if en and ru:
+            return f"{en} ({ru})"
+        return en or ru or key
+    return key
 
-        with col5:
-            # Count items with dependency violations
-            violations = 0
-            for _, row in df.iterrows():
-                issues = validate_milestone_dependencies(row.to_dict())
-                if issues:
-                    violations += 1
-            st.metric("Dependency Issues", violations, delta_color="inverse")
 
-        st.markdown("---")
+def sort_by_russian(data_dict: Dict[str, Dict[str, str]]) -> List[Tuple[str, Dict[str, str]]]:
+    """Sorts a bilingual dictionary by Russian label."""
+    return sorted(data_dict.items(), key=lambda x: x[1].get("ru", x[0]))
 
-        # --- Charts Row ---
-        col_left, col_right = st.columns(2)
 
-        with col_left:
-            st.subheader("Milestone Status Distribution")
-            if 'it_status' in df.columns:
-                # Build a summary dataframe for the bar chart
-                status_summary = {ms.replace('_status', '').upper(): {} for ms in MILESTONES}
+def sort_by_english(data_dict: Dict[str, Dict[str, str]]) -> List[Tuple[str, Dict[str, str]]]:
+    """Sorts a bilingual dictionary by English label."""
+    return sorted(data_dict.items(), key=lambda x: x[1].get("en", x[0]))
 
-                for ms in MILESTONES:
-                    ms_label = ms.replace('_status', '').upper()
-                    for status in ['Completed', 'In Progress', 'Pending', 'Failed', 'N/A']:
-                        count = 0
-                        for _, row in df.iterrows():
-                            scope = row.get('scope_type', '')
-                            if scope == 'Equipment' and ms in ('pt_status', 'saw_status'):
-                                continue
-                            if scope == 'Room':
-                                continue
-                            if str(row.get(ms, '')).strip() == status:
-                                count += 1
-                        if count > 0:
-                            status_summary[ms_label][status] = count
+# =============================================================================
+# KKS VALIDATION ENGINE - Rooppur NPP RPR-QM-AEB0001 Rev B05
+# =============================================================================
 
-                # Convert to DataFrame for st.bar_chart
-                chart_data = []
-                for ms_label, statuses in status_summary.items():
-                    for status, count in statuses.items():
-                        chart_data.append({'Milestone': ms_label, 'Status': status, 'Count': count})
+def validate_kks(kks_code: str) -> Tuple[bool, str, Optional[ScopeType]]:
+    """
+    Validates a KKS code per Rooppur NPP RPR-QM-AEB0001 Rev B05 (2017).
 
-                if chart_data:
-                    chart_df = pd.DataFrame(chart_data)
-                    pivot_df = chart_df.pivot(index='Milestone', columns='Status', values='Count').fillna(0)
-                    # Reorder columns for consistent colors
-                    col_order = ['Completed', 'In Progress', 'Pending', 'Failed', 'N/A']
-                    pivot_df = pivot_df[[c for c in col_order if c in pivot_df.columns]]
-                    st.bar_chart(pivot_df, use_container_width=True, height=400)
-                else:
-                    st.info("No milestone data to display.")
+    KKS Structure: F0 + F1F2F3 + Fn + A1 + An + Bn
+      F0  = Prefix (0=common, 1/2=units, 9=temp) - MANDATORY
+      F1F2F3 = Functional system (3 letters)
+      Fn  = 00-99
+      A1  = Equipment unit letter
+      An  = 001-999 (equipment unit numbering per Appendix B)
+      Bn  = 01-99 (component)
 
-        with col_right:
-            st.subheader("Scope Breakdown")
-            if 'scope_type' in df.columns:
-                scope_counts = df['scope_type'].value_counts().reset_index()
-                scope_counts.columns = ['Scope', 'Count']
-                st.bar_chart(
-                    scope_counts.set_index('Scope'),
-                    use_container_width=True,
-                    height=400
+    Returns:
+        (is_valid: bool, message: str, scope: ScopeType|None)
+    """
+    if not kks_code or not isinstance(kks_code, str):
+        return False, "KKS code must be a non-empty string", None
+
+    kks_upper = kks_code.upper().strip()
+
+    # Check minimum length (F0 + F1F2F3 = 4 chars minimum)
+    if len(kks_upper) < 4:
+        return False, f"KKS code too short ({len(kks_upper)} chars). Minimum: F0 + F1F2F3 (4 chars)", None
+
+    # Extract F0 (first character) - MANDATORY per Rooppur
+    f0 = kks_upper[0]
+    if f0 not in F0_PREFIXES:
+        valid_f0s = ", ".join([f"{k}={v['en']}" for k, v in F0_PREFIXES.items()])
+        return False, (
+            f"Invalid F0 prefix '{f0}'. "
+            f"Valid F0 per Rooppur NPP: {valid_f0s}. "
+            f"F0 is MANDATORY (0=common, 1/2=units, 9=temp)"
+        ), None
+
+    # Extract F1F2F3 (next 3 characters)
+    f1f2f3 = kks_upper[1:4]
+    if not f1f2f3.isalpha() or len(f1f2f3) != 3:
+        return False, f"Invalid F1F2F3 functional system code '{f1f2f3}'. Must be exactly 3 letters.", None
+
+    # Determine scope from F1F2F3
+    if f1f2f3 in SYSTEM_PREFIXES:
+        # Check if it's a room code (contains R in A1 position)
+        if len(kks_upper) >= 5 and kks_upper[4] == "R":
+            return True, f"Valid Room KKS: F0={f0}, F1F2F3={f1f2f3} (Room coding per Rooppur)", ScopeType.ROOM
+        family = get_system_family(f1f2f3)
+        family_str = f" ({family})" if family else ""
+        return True, f"Valid System KKS: F0={f0}, F1F2F3={f1f2f3}{family_str}", ScopeType.SYSTEM
+
+    # Check for Equipment prefix (2-letter A1 code)
+    if f1f2f3[:2] in EQUIPMENT_PREFIXES:
+        return True, f"Valid Equipment KKS: F0={f0}, A1={f1f2f3[:2]} (Equipment unit per Appendix B)", ScopeType.EQUIPMENT
+
+    # Check for Room code pattern (A1 contains R)
+    if "R" in kks_upper[:6]:
+        return True, f"Potential Room KKS: contains R indicator. Verify 3-digit numbering per Rooppur.", ScopeType.ROOM
+
+    valid_systems = ", ".join([f"{k}={v['en']}" for k, v in SYSTEM_FAMILY_CODES.items()])
+    return (
+        False,
+        f"Unknown KKS code '{kks_upper}'. "
+        f"F1F2F3='{f1f2f3}' not in system prefixes. "
+        f"Expected System families: {valid_systems} or Equipment prefix.",
+        None,
+    )
+
+
+def validate_f0(f0: str) -> Tuple[bool, str]:
+    """
+    Validates F0 prefix per Rooppur NPP specific rules.
+
+    Returns:
+        (is_valid: bool, message: str)
+    """
+    if not f0:
+        return False, "F0 prefix is MANDATORY per Rooppur NPP RPR-QM-AEB0001 Rev B05"
+    if f0 not in F0_PREFIXES:
+        valid_f0s = ", ".join([f"{k}={v['en']}" for k, v in F0_PREFIXES.items()])
+        return False, (
+            f"Invalid F0 '{f0}'. Valid: {valid_f0s}. "
+            f"F0 defines: 0=common-station, 1/2=units, 9=temporary"
+        )
+    f0_data = F0_PREFIXES[f0]
+    return True, f"Valid F0={f0}: {f0_data['en']} ({f0_data['ru']})"
+
+
+def validate_room_code(room_code: str) -> Tuple[bool, str, Optional[Dict[str, Any]]]:
+    """
+    Validates room coding per Rooppur NPP Cartesian coordinate system.
+
+    Rules:
+      - A1 must contain "R"
+      - 3-digit numbering
+      - Special shaft codes: 3NN=transport, 4NN=cable, 5NN=stair,
+        6NN=elevator, 7NN=reactor cavity, 8NN=process, 9NN=ventilation
+
+    Returns:
+        (is_valid: bool, message: str, details: dict|None)
+    """
+    if not room_code or not isinstance(room_code, str):
+        return False, "Room code must be a non-empty string", None
+
+    code_upper = room_code.upper().strip()
+
+    # A1 must contain R
+    if "R" not in code_upper:
+        return False, "Room code A1 must contain 'R' per Rooppur NPP agreement", None
+
+    # Extract numeric portion for shaft code check
+    digits = "".join(c for c in code_upper if c.isdigit())
+
+    if not digits:
+        return False, "Room code must contain numeric coordinates (3-digit numbering)", None
+
+    details = {
+        "code": code_upper,
+        "has_r": True,
+        "digits": digits,
+        "is_shaft": False,
+        "shaft_type": None,
+        "shaft_type_ru": None,
+    }
+
+    # Check for special shaft codes (first digit 3-9 with NN pattern)
+    if len(digits) >= 3:
+        first_digit = digits[0]
+        if first_digit in ROOM_SHAFT_CODES:
+            shaft_data = ROOM_SHAFT_CODES[first_digit]
+            details["is_shaft"] = True
+            details["shaft_type"] = shaft_data["en"]
+            details["shaft_type_ru"] = shaft_data["ru"]
+            return (
+                True,
+                f"Valid shaft code: {shaft_data['en']} ({shaft_data['ru']}) ({digits})",
+                details,
+            )
+
+    # Standard room code
+    if len(digits) >= 3:
+        return True, f"Valid room code with 3-digit numbering: {digits}", details
+
+    return False, f"Room code must use 3-digit numbering. Found: {digits}", details
+
+
+def validate_a3(a3_code: str) -> Tuple[bool, str]:
+    """
+    Validates A3 alphabetic code per Rooppur NPP specific usage.
+
+    A3 is used for:
+      - Pulse valves (P)
+      - Safety valves (S)
+      - Double drives (D)
+      - Multiple power supply (M)
+      - Measurement loops (L)
+      - Electrical phases (A, B, C)
+      - Lighting subsystems (N=working, E=emergency, F=escape)
+
+    Returns:
+        (is_valid: bool, message: str)
+    """
+    if not a3_code:
+        return False, "A3 code is empty"
+
+    a3_upper = a3_code.upper().strip()
+
+    if a3_upper in A3_CODES:
+        a3_data = A3_CODES[a3_upper]
+        return True, f"Valid A3 code '{a3_upper}': {a3_data['en']} ({a3_data['ru']})"
+
+    valid_a3s = ", ".join([f"{k}={v['en']}" for k, v in A3_CODES.items()])
+    return False, (
+        f"Unknown A3 code '{a3_upper}'. "
+        f"Valid A3 per Rooppur: {valid_a3s}"
+    )
+
+
+def get_kks_scope(kks_code: str) -> Optional[ScopeType]:
+    """Returns the scope type for a given KKS code, or None if invalid."""
+    valid, _, scope = validate_kks(kks_code)
+    return scope if valid else None
+
+
+def get_system_family(f1f2f3: str) -> Optional[str]:
+    """Returns the English system family description for a given F1F2F3 code."""
+    if not f1f2f3 or len(f1f2f3) < 1:
+        return None
+    first_char = f1f2f3[0].upper()
+    if first_char in SYSTEM_FAMILY_CODES:
+        return SYSTEM_FAMILY_CODES[first_char]["en"]
+    return None
+
+
+def get_system_family_ru(f1f2f3: str) -> Optional[str]:
+    """Returns the Russian system family description for a given F1F2F3 code."""
+    if not f1f2f3 or len(f1f2f3) < 1:
+        return None
+    first_char = f1f2f3[0].upper()
+    if first_char in SYSTEM_FAMILY_CODES:
+        return SYSTEM_FAMILY_CODES[first_char]["ru"]
+    return None
+
+
+def get_bilingual_system_family(f1f2f3: str) -> str:
+    """Returns bilingual system family: English (Russian)."""
+    if not f1f2f3 or len(f1f2f3) < 1:
+        return "Unknown"
+    first_char = f1f2f3[0].upper()
+    if first_char in SYSTEM_FAMILY_CODES:
+        en = SYSTEM_FAMILY_CODES[first_char]["en"]
+        ru = SYSTEM_FAMILY_CODES[first_char]["ru"]
+        return f"{en} ({ru})"
+    return "Unknown"
+
+
+def enforce_scope_milestones(record: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
+    """
+    Enforces milestone rules based on KKS scope per Rooppur NPP.
+    - System: all milestones active
+    - Equipment: PT and SAW set to 'N/A'
+    - Room: all milestones N/A (room coding has no commissioning milestones)
+
+    Returns:
+        (enriched_record, alerts)
+    """
+    alerts = []
+    kks = record.get("system_kks", "")
+    scope = get_kks_scope(kks)
+
+    if scope is None:
+        alerts.append(
+            f"WARNING: Could not determine scope for KKS '{kks}'. "
+            f"Verify F0 prefix is present (mandatory per Rooppur NPP)."
+        )
+        return record, alerts
+
+    record["scope_type"] = scope.value
+
+    if scope == ScopeType.EQUIPMENT:
+        for ms in EQUIPMENT_NA_MILESTONES:
+            current = record.get(ms, "")
+            if current and current not in ("N/A", "Not Applicable", ""):
+                ms_label_en = MILESTONE_LABELS.get(ms, {}).get("en", ms)
+                ms_label_ru = MILESTONE_LABELS.get(ms, {}).get("ru", "")
+                alerts.append(
+                    f"ALERT: KKS '{kks}' (Equipment scope) has non-N/A value '{current}' for '{ms}'. "
+                    f"Auto-corrected to 'N/A'. Equipment does not require {ms_label_en}"
+                    f"{' / ' + ms_label_ru if ms_label_ru else ''}."
                 )
+            record[ms] = "N/A"
 
-        st.markdown("---")
-
-        # --- System Family Breakdown ---
-        st.subheader("System Family Distribution")
-        if 'system_kks' in df.columns:
-            def get_family_from_kks(kks):
-                if pd.isna(kks) or not isinstance(kks, str) or len(kks) < 4:
-                    return "Unknown"
-                family_letter = kks[1].upper() if len(kks) > 1 else ""
-                return SYSTEM_FAMILY_CODES.get(family_letter, "Other/Process")
-
-            df['family'] = df['system_kks'].apply(get_family_from_kks)
-            family_counts = df['family'].value_counts().reset_index()
-            family_counts.columns = ['System Family', 'Count']
-            st.bar_chart(
-                family_counts.set_index('System Family'),
-                use_container_width=True,
-                height=300
-            )
-
-        st.markdown("---")
-
-        # --- Data Table ---
-        st.subheader("Registry Overview")
-
-        # Add color-coded status columns
-        display_df = df.copy()
-
-        def status_badge(val):
-            val = str(val).strip().lower()
-            if val == 'completed':
-                return '🟢 Completed'
-            elif val == 'in progress':
-                return '🟡 In Progress'
-            elif val == 'failed':
-                return '🔴 Failed'
-            elif val in ('n/a', 'not applicable'):
-                return '⚪ N/A'
-            else:
-                return '⚪ Pending'
-
+    elif scope == ScopeType.ROOM:
+        # Room coding has no commissioning milestones per se
         for ms in MILESTONES:
-            if ms in display_df.columns:
-                display_df[ms.replace('_status', '').upper()] = display_df[ms].apply(status_badge)
+            current = record.get(ms, "")
+            if current and current not in ("N/A", "Not Applicable", ""):
+                ms_label_en = MILESTONE_LABELS.get(ms, {}).get("en", ms)
+                ms_label_ru = MILESTONE_LABELS.get(ms, {}).get("ru", "")
+                alerts.append(
+                    f"ALERT: KKS '{kks}' (Room coding) has milestone value '{current}' for '{ms}'. "
+                    f"Room codes do not have commissioning milestones. Auto-corrected to 'N/A'. "
+                    f"{ms_label_en}{' / ' + ms_label_ru if ms_label_ru else ''}"
+                )
+            record[ms] = "N/A"
 
-        # Select display columns
-        display_cols = ['system', 'system_kks', 'scope_type', 'component'] +                        [ms.replace('_status', '').upper() for ms in MILESTONES if ms in display_df.columns] +                        ['comments']
-        display_cols = [c for c in display_cols if c in display_df.columns]
+    return record, alerts
 
-        st.dataframe(
-            display_df[display_cols],
-            use_container_width=True,
-            hide_index=True
-        )
 
 # =============================================================================
-# TAB 2: DATA IMPORT & SYNC
+# MILESTONE DEPENDENCY VALIDATOR
 # =============================================================================
 
-with tab2:
-    st.subheader("Upload & Intelligent Import")
-    st.markdown("""
-    Upload commissioning registry files (.csv, .xlsx) or raw text.
-    The AI engine will extract structured data, validate KKS codes per Rooppur NPP RPR-QM-AEB0001 Rev B05,
-    enforce scope rules, and check milestone dependencies before upserting to the database.
-    """)
+def validate_milestone_dependencies(record: Dict[str, Any]) -> List[str]:
+    """
+    Validates that milestone dependencies are satisfied.
+    Currently enforces: PIC must be 'Completed' before HT can be 'Completed'.
 
-    uploaded = st.file_uploader(
-        "Upload Registry (.csv / .xlsx / .txt)", 
-        type=["csv", "xlsx", "xls", "txt"]
+    Returns list of violation messages (empty if all valid).
+    """
+    violations = []
+
+    for prereq, dependent in MILESTONE_DEPENDENCIES.items():
+        prereq_val = record.get(prereq, "").strip().lower()
+        dependent_val = record.get(dependent, "").strip().lower()
+
+        if dependent_val == "completed" and prereq_val != "completed":
+            prereq_label_en = MILESTONE_LABELS.get(prereq, {}).get("en", prereq)
+            prereq_label_ru = MILESTONE_LABELS.get(prereq, {}).get("ru", "")
+            dependent_label_en = MILESTONE_LABELS.get(dependent, {}).get("en", dependent)
+            dependent_label_ru = MILESTONE_LABELS.get(dependent, {}).get("ru", "")
+
+            prereq_full = f"{prereq_label_en}{' / ' + prereq_label_ru if prereq_label_ru else ''}"
+            dependent_full = f"{dependent_label_en}{' / ' + dependent_label_ru if dependent_label_ru else ''}"
+
+            violations.append(
+                f"DEPENDENCY VIOLATION: '{dependent}' ({dependent_full}) is marked 'Completed' but prerequisite "
+                f"'{prereq}' ({prereq_full}) is '{record.get(prereq, 'N/A')}'. "
+                f"{prereq_label_en} must be Completed before {dependent_label_en}."
+            )
+
+    return violations
+
+
+# =============================================================================
+# RECORD VALIDATOR
+# =============================================================================
+
+def validate_record(record: Dict[str, Any]) -> Tuple[bool, List[str]]:
+    """
+    Full validation of a registry record per Rooppur NPP KKS rules.
+    Returns (is_valid, list_of_issues).
+    """
+    issues = []
+
+    # Check required fields
+    for field in REGISTRY_REQUIRED_FIELDS:
+        if not record.get(field):
+            issues.append(f"Missing required field: '{field}'")
+
+    # Validate KKS (including mandatory F0)
+    kks = record.get("system_kks", "")
+    valid_kks, kks_msg, scope = validate_kks(kks)
+    if not valid_kks:
+        issues.append(f"KKS Validation Error: {kks_msg}")
+    else:
+        # Additional F0 validation
+        if kks:
+            f0 = kks[0].upper() if kks else ""
+            f0_valid, f0_msg = validate_f0(f0)
+            if not f0_valid:
+                issues.append(f"F0 Validation Error: {f0_msg}")
+
+    # Validate status values
+    for ms in MILESTONES:
+        val = record.get(ms, "")
+        if val and val not in VALID_STATUSES:
+            issues.append(f"Invalid status '{val}' for '{ms}'. Valid: {VALID_STATUSES}")
+
+    # Check dependencies
+    dep_issues = validate_milestone_dependencies(record)
+    issues.extend(dep_issues)
+
+    return len(issues) == 0, issues
+
+
+# =============================================================================
+# CUSTOM CSS
+# =============================================================================
+
+def apply_custom_css():
+    """
+    Injects custom CSS styling into the Streamlit DOM to optimize workspace layout,
+    improve visual hierarchy, and enforce professional engineering aesthetics.
+    """
+    st.markdown(
+        """
+        <style>
+        /* Optimize viewport real estate */
+        .block-container { 
+            padding-top: 1.5rem; 
+            padding-bottom: 1.5rem; 
+            max-width: 95% !important;
+        }
+
+        /* Typography Polish */
+        h1 { color: #0F172A; font-weight: 800; letter-spacing: -0.05em; }
+        h2 { color: #1E3A8A; font-weight: 700; border-bottom: 2px solid #E2E8F0; padding-bottom: 0.25rem; }
+        h3 { color: #0369A1; font-weight: 600; }
+
+        /* Metric Box Adjustments */
+        [data-testid="stMetricValue"] { font-size: 2.2rem; font-weight: 700; color: #1E293B; }
+        [data-testid="stMetricLabel"] { font-weight: 600; color: #64748B; text-transform: uppercase; font-size: 0.8rem; }
+
+        /* Status Badges */
+        .badge { padding: 4px 8px; border-radius: 4px; font-weight: bold; font-size: 12px; }
+        .badge-verified { background-color: #DCFCE7; color: #15803D; }
+        .badge-progress { background-color: #FEF9C3; color: #A16207; }
+        .badge-pending { background-color: #F1F5F9; color: #475569; }
+        .badge-failed { background-color: #FEE2E2; color: #B91C1C; }
+        .badge-na { background-color: #E2E8F0; color: #475569; font-style: italic; }
+
+        /* Alert Boxes */
+        .alert-box {
+            padding: 12px 16px;
+            border-radius: 8px;
+            margin: 8px 0;
+            border-left: 4px solid;
+        }
+        .alert-warning { background-color: #FEF9C3; border-color: #EAB308; color: #854D0E; }
+        .alert-error { background-color: #FEE2E2; border-color: #EF4444; color: #991B1B; }
+        .alert-info { background-color: #DBEAFE; border-color: #3B82F6; color: #1E40AF; }
+        </style>
+        """,
+        unsafe_allow_html=True,
     )
-
-    if uploaded:
-        col1, col2 = st.columns([1, 3])
-        with col1:
-            process_btn = st.button("🚀 Run Token-Efficient Sync", type="primary", use_container_width=True)
-
-        if process_btn:
-            with st.spinner("Processing file with Rooppur NPP KKS validation..."):
-                file_bytes = uploaded.getvalue()
-                records_processed, alerts = process_file_smart(file_bytes, uploaded.name)
-
-            if records_processed > 0:
-                st.success(f"✅ Sync Complete! {records_processed} record(s) processed successfully.")
-            else:
-                st.warning("⚠️ No records were processed. Check alerts below.")
-
-            if alerts:
-                with st.expander(f"📋 Processing Log ({len(alerts)} entries)", expanded=True):
-                    for alert in alerts:
-                        if alert.startswith("ERROR") or alert.startswith("KKS ERROR") or alert.startswith("KKS F0 ERROR"):
-                            st.error(alert)
-                        elif alert.startswith("ALERT") or alert.startswith("WARNING") or alert.startswith("KKS WARNING"):
-                            st.warning(alert)
-                        elif alert.startswith("DEPENDENCY"):
-                            st.info(alert)
-                        elif alert.startswith("KKS INFO"):
-                            st.success(alert)
-                        else:
-                            st.write(alert)
-
-# =============================================================================
-# TAB 3: MANUAL / FIELD UPDATES
-# =============================================================================
-
-with tab3:
-    st.subheader("Manual Record Entry & Edit")
-    st.markdown("""
-    Add new records or update existing ones. The form enforces KKS taxonomy per Rooppur NPP RPR-QM-AEB0001 Rev B05,
-    scope-based milestone rules, and dependency validation in real-time.
-
-    **KKS Structure:** F0 (mandatory) + F1F2F3 + Fn + A1 + An + Bn
-    - F0: 0=common, 1=Unit1, 2=Unit2, 9=temp, 5=HVAC diesel
-    - F1F2F3: A=networks, B=power, C=I&C, E=fuel/waste, F=fuel handling, G=water/waste
-    """)
-
-    # --- Search existing record ---
-    st.markdown("#### 🔍 Load Existing Record (Optional)")
-    search_col1, search_col2, search_col3 = st.columns([2, 2, 1])
-
-    with search_col1:
-        search_system = st.text_input("System Name", key="search_sys", placeholder="e.g., Feedwater")
-    with search_col2:
-        search_component = st.text_input("Component Tag", key="search_comp", placeholder="e.g., Pump-001")
-    with search_col3:
-        st.markdown("<br>", unsafe_allow_html=True)
-        load_btn = st.button("🔎 Load", use_container_width=True)
-
-    # Pre-populate form if record found
-    prefill = {}
-    if load_btn and search_system and search_component:
-        existing = get_registry_row(search_system, search_component)
-        if existing:
-            prefill = existing
-            st.success(f"Loaded existing record: {existing.get('system_kks', 'N/A')}")
-        else:
-            st.info("No existing record found. A new record will be created on submit.")
-
-    st.markdown("---")
-
-    # --- Entry Form ---
-    st.markdown("#### ✏️ Record Details")
-
-    with st.form("manual_update", clear_on_submit=False):
-        col_a, col_b = st.columns(2)
-
-        with col_a:
-            sys_name = st.text_input(
-                "System Name *", 
-                value=prefill.get('system', ''),
-                help="Name of the system this component belongs to"
-            )
-            kks_code = st.text_input(
-                "KKS Code *", 
-                value=prefill.get('system_kks', ''),
-                help="F0 (mandatory: 0,1,2,5,9) + F1F2F3 (3 letters). Example: 1JEA10, 0AAA01"
-            )
-
-        with col_b:
-            comp_tag = st.text_input(
-                "Component Tag *", 
-                value=prefill.get('component', ''),
-                help="Unique component identifier"
-            )
-            # Auto-detected scope display
-            detected_scope = ""
-            scope_details = ""
-            if kks_code:
-                valid, msg, scope = validate_kks(kks_code)
-                if scope:
-                    detected_scope = scope.value
-                    scope_details = msg
-
-            st.text_input(
-                "Detected Scope", 
-                value=detected_scope,
-                disabled=True,
-                help=scope_details if scope_details else "Auto-detected from KKS prefix"
-            )
-
-        # Show KKS validation details
-        if kks_code:
-            valid, msg, scope = validate_kks(kks_code)
-            if valid:
-                st.success(f"✅ {msg}")
-                # Show F0 details
-                f0 = kks_code[0].upper()
-                f0_valid, f0_msg = validate_f0(f0)
-                if f0_valid:
-                    st.info(f"📌 F0 Validation: {f0_msg}")
-                # Show system family
-                if len(kks_code) >= 4:
-                    family = get_system_family(kks_code[1:4])
-                    if family:
-                        st.info(f"📌 System Family: {family}")
-                # Check for room code
-                if 'R' in kks_code[:6].upper():
-                    room_valid, room_msg, _ = validate_room_code(kks_code)
-                    if room_valid:
-                        st.info(f"📌 Room Code: {room_msg}")
-            else:
-                st.error(f"❌ {msg}")
-
-        st.markdown("---")
-        st.markdown("#### 📋 Commissioning Milestones")
-
-        # Determine which milestones are active based on KKS
-        is_equipment = (detected_scope == 'Equipment')
-        is_room = (detected_scope == 'Room')
-
-        ms_col1, ms_col2, ms_col3 = st.columns(3)
-
-        with ms_col1:
-            it_stat = st.selectbox(
-                "IT (Individual Test)",
-                ["Pending", "In Progress", "Completed", "Failed", "N/A"],
-                index=["Pending", "In Progress", "Completed", "Failed", "N/A"].index(
-                    prefill.get('it_status', 'Pending')
-                ) if prefill.get('it_status') in ["Pending", "In Progress", "Completed", "Failed", "N/A"] else 0,
-                disabled=is_room,
-                help="N/A for Room scope" if is_room else ""
-            )
-            pic_stat = st.selectbox(
-                "PIC (Post-Install Cleaning)",
-                ["Pending", "In Progress", "Completed", "Failed", "N/A"],
-                index=["Pending", "In Progress", "Completed", "Failed", "N/A"].index(
-                    prefill.get('pic_status', 'Pending')
-                ) if prefill.get('pic_status') in ["Pending", "In Progress", "Completed", "Failed", "N/A"] else 0,
-                disabled=is_room,
-                help="N/A for Room scope" if is_room else ""
-            )
-
-        with ms_col2:
-            ht_stat = st.selectbox(
-                "HT (Hydro Test)",
-                ["Pending", "In Progress", "Completed", "Failed", "N/A"],
-                index=["Pending", "In Progress", "Completed", "Failed", "N/A"].index(
-                    prefill.get('ht_status', 'Pending')
-                ) if prefill.get('ht_status') in ["Pending", "In Progress", "Completed", "Failed", "N/A"] else 0,
-                disabled=is_room,
-                help="N/A for Room scope" if is_room else ""
-            )
-            pt_stat = st.selectbox(
-                "PT (Pneumatic Test)",
-                ["N/A", "Pending", "In Progress", "Completed", "Failed"],
-                index=0 if is_equipment or is_room else (
-                    ["N/A", "Pending", "In Progress", "Completed", "Failed"].index(
-                        prefill.get('pt_status', 'Pending')
-                    ) if prefill.get('pt_status') in ["N/A", "Pending", "In Progress", "Completed", "Failed"] else 1
-                ),
-                disabled=is_equipment or is_room,
-                help="N/A for Equipment and Room scope" if is_equipment or is_room else ""
-            )
-
-        with ms_col3:
-            saw_stat = st.selectbox(
-                "SAW (Start-up & Adjustment)",
-                ["N/A", "Pending", "In Progress", "Completed", "Failed"],
-                index=0 if is_equipment or is_room else (
-                    ["N/A", "Pending", "In Progress", "Completed", "Failed"].index(
-                        prefill.get('saw_status', 'Pending')
-                    ) if prefill.get('saw_status') in ["N/A", "Pending", "In Progress", "Completed", "Failed"] else 1
-                ),
-                disabled=is_equipment or is_room,
-                help="N/A for Equipment and Room scope" if is_equipment or is_room else ""
-            )
-
-        comments = st.text_area(
-            "Comments / Notes",
-            value=prefill.get('comments', ''),
-            placeholder="Enter any special notes, anomalies, KKS code context, or shift handover comments..."
-        )
-
-        # Dependency warning
-        if pic_stat != "Completed" and ht_stat == "Completed":
-            warning_html = (
-                '<div class="alert-box alert-warning">'
-                '⚠️ <b>Dependency Warning:</b> HT is marked Completed but PIC is not. '
-                'PIC must precede HT per commissioning procedure.</div>'
-            )
-            st.markdown(warning_html, unsafe_allow_html=True)
-
-        st.markdown("---")
-        submitted = st.form_submit_button("💾 Submit Record", use_container_width=True, type="primary")
-
-        if submitted:
-            if not sys_name or not kks_code or not comp_tag:
-                st.error("❌ Required fields missing: System Name, KKS Code, and Component Tag are mandatory.")
-            else:
-                # Validate KKS before submission
-                valid, msg, scope = validate_kks(kks_code)
-                if not valid:
-                    st.error(f"❌ KKS Validation Failed: {msg}")
-                else:
-                    record = {
-                        "system": sys_name,
-                        "system_kks": kks_code,
-                        "component": comp_tag,
-                        "it_status": it_stat,
-                        "pic_status": pic_stat,
-                        "ht_status": ht_stat,
-                        "pt_status": pt_stat,
-                        "saw_status": saw_stat,
-                        "comments": comments
-                    }
-
-                    ok, msgs = upsert_registry_row(record)
-                    if ok:
-                        st.success("✅ Registry Updated Successfully!")
-                    for msg in msgs:
-                        if msg.startswith("ALERT") or msg.startswith("WARNING"):
-                            st.warning(msg)
-                        elif msg.startswith("DEPENDENCY"):
-                            st.info(msg)
-                        elif msg.startswith("KKS INFO"):
-                            st.success(msg)
-                        elif msg.startswith("KKS ERROR") or msg.startswith("KKS F0 ERROR"):
-                            st.error(msg)
-
-# =============================================================================
-# TAB 4: SHIFT NOTE PARSER
-# =============================================================================
-
-with tab4:
-    st.subheader("📝 Natural Language Shift Note Parser")
-    st.markdown("""
-    Paste raw shift notes, field observations, or handover logs.
-    The AI will extract structured commissioning data, validate KKS codes per Rooppur NPP rules,
-    enforce scope rules, and flag any milestone dependency violations.
-
-    **Note:** The AI is instructed to identify mandatory F0 prefixes and Rooppur-specific KKS structures.
-    """)
-
-    notes_text = st.text_area(
-        "Shift Notes",
-        height=250,
-        placeholder="Example: 1JEA10 feedwater pump AA001 IT completed. PIC in progress due to debris found in strainer. 0JEB20 condensate system HT passed, awaiting SAW scheduling. Room 1R101 cable shaft inspection done."
-    )
-
-    if st.button("🔍 Parse & Validate", type="primary", use_container_width=True) and notes_text.strip():
-        with st.spinner("AI analyzing shift notes with Rooppur NPP KKS rules..."):
-            records, alerts = parse_shift_notes(notes_text)
-
-        if records:
-            st.success(f"✅ Extracted {len(records)} record(s) from shift notes.")
-
-            # Preview table
-            preview_df = pd.DataFrame(records)
-            st.subheader("📋 Extracted Records Preview")
-            st.dataframe(preview_df, use_container_width=True, hide_index=True)
-
-            # Alerts
-            if alerts:
-                with st.expander(f"⚠️ Validation Alerts ({len(alerts)})", expanded=True):
-                    for alert in alerts:
-                        if "N/A" in alert and "Equipment" in alert:
-                            st.markdown(
-                                f'<div class="alert-box alert-warning">{alert}</div>',
-                                unsafe_allow_html=True
-                            )
-                        elif "DEPENDENCY" in alert:
-                            st.markdown(
-                                f'<div class="alert-box alert-error">{alert}</div>',
-                                unsafe_allow_html=True
-                            )
-                        elif alert.startswith("KKS INFO"):
-                            st.success(alert)
-                        elif alert.startswith("KKS WARNING") or alert.startswith("KKS ERROR"):
-                            st.error(alert)
-                        else:
-                            st.write(alert)
-
-            # Commit option
-            st.markdown("---")
-            if st.button("💾 Commit All to Registry", type="primary", use_container_width=True):
-                success, all_msgs = upsert_registry_batch(records)
-                st.success(f"✅ Committed {success}/{len(records)} records to registry.")
-                if success < len(records):
-                    st.warning("Some records failed validation. Check logs above.")
-        else:
-            st.error("❌ Could not extract any valid records from the provided notes.")
-            if alerts:
-                for alert in alerts:
-                    st.error(alert)
-
-# =============================================================================
-# TAB 5: KKS REFERENCE
-# =============================================================================
-
-with tab5:
-    st.subheader("📖 Rooppur NPP KKS Coding Reference")
-    st.markdown("*Based on document RPR-QM-AEB0001 Revision B05 (2017)*")
-
-    st.markdown("---")
-
-    # F0 Prefixes
-    st.markdown("#### F0 Prefix (Mandatory)")
-    f0_df = pd.DataFrame([
-        {"Prefix": k, "Description": v} for k, v in F0_PREFIXES.items()
-    ])
-    st.dataframe(f0_df, use_container_width=True, hide_index=True)
-
-    st.markdown("---")
-
-    # System Families
-    st.markdown("#### System Families (F1 First Letter)")
-    family_df = pd.DataFrame([
-        {"Family Code": k, "Description": v} for k, v in SYSTEM_FAMILY_CODES.items()
-    ])
-    st.dataframe(family_df, use_container_width=True, hide_index=True)
-
-    st.markdown("---")
-
-    # A3 Codes
-    st.markdown("#### A3 Alphabetic Codes")
-    a3_df = pd.DataFrame([
-        {"Code": k, "Description": v} for k, v in A3_CODES.items()
-    ])
-    st.dataframe(a3_df, use_container_width=True, hide_index=True)
-
-    st.markdown("---")
-
-    # Room Shaft Codes
-    st.markdown("#### Room Shaft Codes (Special)")
-    shaft_df = pd.DataFrame([
-        {"Code": k + "NN", "Description": v} for k, v in ROOM_SHAFT_CODES.items()
-    ])
-    st.dataframe(shaft_df, use_container_width=True, hide_index=True)
-
-    st.markdown("---")
-
-    # KKS Structure
-    st.markdown("#### KKS Code Structure")
-    st.markdown("""
-    ```
-    F0 + F1F2F3 + Fn + A1 + An + Bn
-
-    F0  = Prefix (MANDATORY)
-          0 = Common station
-          1 = Unit 1 / Safety train
-          2 = Unit 2 / Safety train
-          5 = HVAC from NO diesel-generator
-          9 = Temporary installations
-
-    F1F2F3 = Functional system (3 letters)
-             A = Networks/Switchgears
-             B = Power transmission/Auxiliary supply
-             C = I&C equipment
-             E = Fuel/Waste
-             F = Nuclear fuel handling
-             G = Water supply/Waste removal
-             J = Process systems (VVER typical)
-
-    Fn  = 00-99
-    A1  = Equipment unit letter
-    An  = 001-999 (per Appendix B)
-    Bn  = 01-99 component
-    ```
-    """)
-
-    st.markdown("---")
-    st.markdown("**Limitation:** Equipment unit numbering validation (001-900) requires Appendix B which is not fully detailed in the provided context. Codes outside this range will generate warnings.")
