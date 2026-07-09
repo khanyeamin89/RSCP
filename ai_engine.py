@@ -203,9 +203,7 @@ def smart_chunk_text(text: str, max_chunk_size: int = 15000) -> List[str]:
     Falls back to character-based chunking if no clear boundaries found.
     """
     # Try to split by double newlines (common record separator)
-    records = text.split('
-
-')
+    records = text.split('\n\n')  # Properly quoted and closed
 
     chunks = []
     current_chunk = ""
