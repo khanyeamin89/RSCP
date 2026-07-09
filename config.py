@@ -194,7 +194,7 @@ SYSTEM_FAMILY_CODES: Dict[str, Dict[str, str]] = {
         "en": "Spare / Reserve",
         "ru": "Резерв",
     },
-}}
+}
 
 # Valid system prefixes (F1F2F3) - All A-Z families per VGB KKS
 # Generated programmatically: 26 families × 26 subsystems × 26 variants = 17,576 codes
