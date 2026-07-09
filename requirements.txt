@@ -32,3 +32,5 @@ requests>=2.31.0
 # FILE PARSING - Excel support
 # ------------------------------------------------------------------------------
 openpyxl>=3.1.0
+
+matplotlib
