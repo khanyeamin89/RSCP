@@ -3,12 +3,13 @@ Reactor Shop Commissioning - AI Processing Engine
 ==================================================
 Natural language parsing, KKS classification, and intelligent data extraction.
 
-KKS Coding based on Rooppur NPP document RPR-QM-AEB0001 Revision B05 (2017)
-"Agreement on Using the KKS Coding System" (VGB-B 105 E 2010, VGB-B 106 E 2004)
+KKS Coding based on the Rooppur NPP Reactor Shop KKS Code Master List
+(hard-coded in config.py — see config.py header for source documents).
 """
 
 import json
 import hashlib
+import time
 import streamlit as st
 import pandas as pd
 from io import BytesIO
@@ -17,18 +18,12 @@ from typing import Dict, List, Any, Tuple, Optional
 from database import upsert_registry_row, check_chunk_exists, mark_chunk_done
 from config import (
     get_kks_scope,
+    parse_kks,
     validate_milestone_dependencies,
-    validate_f0,
-    validate_room_code,
-    validate_a3,
-    get_system_family,
     ScopeType,
-    SYSTEM_PREFIXES,
-    EQUIPMENT_PREFIXES,
-    F0_PREFIXES,
-    A3_CODES,
-    ROOM_SHAFT_CODES,
-    SYSTEM_FAMILY_CODES,
+    UNIT_CODES,
+    FUNCTION_KEY_LEGEND,
+    EQUIPMENT_TYPE_LEGEND,
     MILESTONES,
     MILESTONE_LABELS,
     VALID_STATUSES,
@@ -38,6 +33,71 @@ from config import (
 # =============================================================================
 # GROQ API INTEGRATION
 # =============================================================================
+
+def _build_system_prompt() -> str:
+    """Builds the Groq system prompt using the real, hard-coded KKS reference
+    tables from config.py so the model is grounded in actual Rooppur codes
+    rather than a guessed scheme."""
+
+    unit_lines = "\n".join(f"  {k} = {v}" for k, v in UNIT_CODES.items())
+    fkey_lines = ", ".join(f"{k}={v}" for k, v in FUNCTION_KEY_LEGEND.items())
+    common_types = ", ".join(
+        f"{k}={v.split(' — ')[-1] if ' — ' in v else v}"
+        for k, v in list(EQUIPMENT_TYPE_LEGEND.items())[:15]
+    )
+
+    return f"""You are a nuclear commissioning data extraction expert for the Rooppur NPP project.
+
+Extract commissioning registry data from the provided shift notes into valid JSON.
+
+KKS CODING RULES (Rooppur NPP Reactor Shop KKS Code Master List):
+- KKS = Kraftwerk-Kennzeichensystem, the German-origin power-plant identification standard.
+- There are three real code shapes, all starting with a mandatory 2-digit Unit code:
+    Equipment: [Unit-2][System-2to4 letters][Subsystem-2digit][Type-2letter][Seq-3digit]  e.g. 10JAA10BB001
+    Building : [Unit-2]U[2 letters]                                                       e.g. 10UJA
+    System   : [Unit-2][System-2to4 letters]                                              e.g. 10JAA
+- Known unit codes:
+{unit_lines}
+  (other 2-digit unit codes exist for shared/auxiliary facility zones)
+- System code function keys (1st letter of the system code): {fkey_lines}
+- Common equipment type codes (2 letters, precede the 3-digit sequence number): {common_types}
+- Milestones (COMMISSIONING TESTS - apply to ALL scope types): IT=Individual Test, PIC=Post-Install Cleaning, HT=Hydro Test, PT=Pneumatic Test, SAW=Start-up & Adjustment
+
+OUTPUT FORMAT:
+{{
+    "records": [
+        {{
+            "system": "System Name",
+            "system_kks": "Full KKS code including the mandatory 2-digit Unit prefix",
+            "scope_type": "System|Equipment|Building",
+            "component": "Component Tag",
+            "it_status": "Pending|In Progress|Completed|Failed|N/A",
+            "pic_status": "Pending|In Progress|Completed|Failed|N/A",
+            "ht_status": "Pending|In Progress|Completed|Failed|N/A",
+            "pt_status": "Pending|In Progress|Completed|Failed|N/A",
+            "saw_status": "Pending|In Progress|Completed|Failed|N/A",
+            "comments": "Any relevant notes including KKS context"
+        }}
+    ]
+}}
+
+RULES:
+1. Identify KKS codes first. The 2-digit Unit prefix is MANDATORY.
+2. System KKS: Unit + 2-4 letter system code (JAA, KBA, etc.).
+3. Equipment KKS: Unit + system code + 2-digit subsystem + 2-letter type + 3-digit sequence.
+4. Building KKS: Unit + "U" + 2 letters.
+5. Status keywords: "done", "complete", "finished", "passed" -> "Completed"
+6. Status keywords: "ongoing", "in progress", "started" -> "In Progress"
+7. Status keywords: "failed", "rejected", "issue" -> "Failed"
+8. Status keywords: "pending", "not started", "awaiting" -> "Pending"
+9. If a milestone is not mentioned, default to "Pending".
+10. All 5 milestones (IT, PIC, HT, PT, SAW) apply to ALL scope types. They are commissioning tests.
+11. PIC (Post Installation Cleaning) must precede HT (Hydro Test).
+12. Include any anomalies, KKS code issues, or special notes in "comments".
+13. If scope cannot be determined from KKS, infer from context ("system" vs "equipment" vs "building").
+14. Never invent a Unit code — if the shift note doesn't specify one, use "00" (common/shared) and note the assumption in "comments".
+"""
+
 
 def ask_groq(prompt: str, max_retries: int = 2) -> Optional[Dict[str, Any]]:
     """
@@ -51,67 +111,16 @@ def ask_groq(prompt: str, max_retries: int = 2) -> Optional[Dict[str, Any]]:
         Parsed JSON dict or None on failure
     """
     import requests
-    import time
 
     api_key = st.secrets.get("GROQ_API_KEY")
     if not api_key:
         st.error("GROQ_API_KEY not found in Streamlit secrets.")
         return None
 
-    system_prompt = """You are a nuclear commissioning data extraction expert for the Rooppur NPP project.
-
-Extract commissioning registry data from the provided shift notes into valid JSON.
-
-KKS CODING RULES (Rooppur NPP RPR-QM-AEB0001 Rev B05 2017):
-- KKS = Kraftwerk-Kennzeichensystem, developed by VGB (German industrialists association)
-- Code structure: F0 (MANDATORY prefix) + F1F2F3 (functional system, 3 letters) + Fn (00-99) + A1 (equipment unit letter) + An (001-999) + Bn (01-99 component)
-- F0 is MANDATORY: 0=common-station, 1=Unit 1, 2=Unit 2, 9=temporary
-- Special F0: 1&2=safety train elements, 0=normal operation, 5=HVAC from NO diesel-generator
-- System families: A=Networks/Switchgears, B=Power transmission/Auxiliary supply, C=I&C equipment, E=Fuel/Waste, F=Nuclear fuel handling, G=Water supply/Waste removal
-- A3 alphabetic code: P=pulse valve, S=safety valve, D=double drive, M=multiple power supply, L=measurement loop, A/B/C=electrical phases, N=working lighting, E=emergency lighting, F=escape lighting
-- Room coding: Cartesian coordinates, A1 contains R, 3-digit numbering, shaft codes: 3NN=transport, 4NN=cable, 5NN=stair, 6NN=elevator, 7NN=reactor cavity, 8NN=process, 9NN=ventilation
-- Equipment unit numbering: 001-900 per Appendix B
-- Milestones (COMMISSIONING TESTS - apply to ALL scope types): IT=Individual Test, PIC=Post-Install Cleaning, HT=Hydro Test, PT=Pneumatic Test, SAW=Start-up & Adjustment
-
-OUTPUT FORMAT:
-{
-    "records": [
-        {
-            "system": "System Name",
-            "system_kks": "KKS Code with mandatory F0 prefix",
-            "scope_type": "System|Equipment|Room",
-            "component": "Component Tag",
-            "it_status": "Pending|In Progress|Completed|Failed|N/A",
-            "pic_status": "Pending|In Progress|Completed|Failed|N/A",
-            "ht_status": "Pending|In Progress|Completed|Failed|N/A",
-            "pt_status": "Pending|In Progress|Completed|Failed|N/A",
-            "saw_status": "Pending|In Progress|Completed|Failed|N/A",
-            "comments": "Any relevant notes including KKS context"
-        }
-    ]
-}
-
-RULES:
-1. Identify KKS codes first. F0 prefix is MANDATORY (0,1,2,5,9).
-2. System KKS: F0 + 3-letter system code (JEA, JAA, etc.).
-3. Equipment KKS: F0 + 2-letter equipment prefix (AA, AP, etc.) + numbering.
-4. Room KKS: contains "R" in A1 position, uses Cartesian coordinates.
-5. Status keywords: "done", "complete", "finished", "passed" -> "Completed"
-6. Status keywords: "ongoing", "in progress", "started" -> "In Progress"
-7. Status keywords: "failed", "rejected", "issue" -> "Failed"
-8. Status keywords: "pending", "not started", "awaiting" -> "Pending"
-9. If a milestone is not mentioned, default to "Pending".
-10. All 5 milestones (IT, PIC, HT, PT, SAW) apply to ALL scope types. They are commissioning tests.
-11. PIC (Post Installation Cleaning) must precede HT (Hydro Test).
-12. Include any anomalies, KKS code issues, or special notes in "comments".
-13. If scope cannot be determined from KKS, infer from context ("system" vs "equipment" vs "room").
-14. If equipment unit numbering seems outside 001-900 range, note it in comments per Appendix B limitation.
-"""
-
     payload = {
         "model": "llama-3.3-70b-versatile",
         "messages": [
-            {"role": "system", "content": system_prompt},
+            {"role": "system", "content": _build_system_prompt()},
             {"role": "user", "content": prompt}
         ],
         "response_format": {"type": "json_object"},
@@ -124,6 +133,7 @@ RULES:
         "Content-Type": "application/json"
     }
 
+    response = None
     for attempt in range(max_retries + 1):
         try:
             response = requests.post(
@@ -136,21 +146,26 @@ RULES:
 
             result = response.json()
             content = result['choices'][0]['message']['content']
-            parsed = json.loads(content)
-            return parsed
+            return json.loads(content)
 
         except requests.exceptions.HTTPError as e:
-            if response.status_code == 429 and attempt < max_retries:
+            if response is not None and response.status_code == 429 and attempt < max_retries:
                 wait_time = 2 ** attempt
                 st.warning(f"Rate limited. Retrying in {wait_time}s...")
                 time.sleep(wait_time)
                 continue
-            st.error(f"Groq API HTTP Error ({response.status_code}): {str(e)}")
+            status = response.status_code if response is not None else "unknown"
+            st.error(f"Groq API HTTP Error ({status}): {str(e)}")
             return None
         except json.JSONDecodeError as e:
             st.error(f"Groq returned invalid JSON: {str(e)}")
             return None
-        except Exception as e:
+        except requests.exceptions.RequestException as e:
+            if attempt < max_retries:
+                wait_time = 2 ** attempt
+                st.warning(f"Request failed ({str(e)}). Retrying in {wait_time}s...")
+                time.sleep(wait_time)
+                continue
             st.error(f"Groq API call failed: {str(e)}")
             return None
 
@@ -171,7 +186,7 @@ def extract_text_from_file(file_bytes: bytes, file_name: str) -> str:
         try:
             df = pd.read_csv(BytesIO(file_bytes))
             return df.to_string(index=False)
-        except Exception as e:
+        except Exception:
             return file_bytes.decode('utf-8', errors='ignore')
 
     elif file_lower.endswith('.xlsx') or file_lower.endswith('.xls'):
@@ -191,6 +206,9 @@ def smart_chunk_text(text: str, max_chunk_size: int = 15000) -> List[str]:
     Chunks text intelligently by trying to preserve record boundaries.
     Falls back to character-based chunking if no clear boundaries found.
     """
+    if not text:
+        return []
+
     records = text.split('\n\n')
 
     chunks = []
@@ -214,7 +232,8 @@ def smart_chunk_text(text: str, max_chunk_size: int = 15000) -> List[str]:
             current = ""
             for line in lines:
                 if len(current) + len(line) + 1 > max_chunk_size:
-                    final_chunks.append(current.strip())
+                    if current:
+                        final_chunks.append(current.strip())
                     current = line
                 else:
                     current += "\n" + line if current else line
@@ -232,74 +251,32 @@ def smart_chunk_text(text: str, max_chunk_size: int = 15000) -> List[str]:
 
 def post_process_kks_record(record: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
     """
-    Post-processes an AI-extracted record to enforce Rooppur NPP KKS rules.
-    Validates F0, room codes, A3 codes, and system families.
+    Post-processes an AI-extracted record by running it through the single,
+    centralized KKS parser in config.py (previously this duplicated the
+    parsing logic with hard-coded string slices that assumed a 1-digit unit
+    prefix, which no longer matches the real 2-digit Rooppur unit codes and
+    caused incorrect/failed validation).
 
     Returns:
-        (enriched_record, alerts)
+        (record, alerts)
     """
-    alerts = []
+    alerts: List[str] = []
     kks = record.get("system_kks", "")
 
     if not kks:
         alerts.append("WARNING: No KKS code found in extracted record")
         return record, alerts
 
-    kks_upper = kks.upper().strip()
+    parsed = parse_kks(kks)
+    if not parsed.valid:
+        alerts.append(f"KKS ERROR: {parsed.message}")
+        return record, alerts
 
-    # Validate F0 (mandatory)
-    if len(kks_upper) >= 1:
-        f0 = kks_upper[0]
-        f0_valid, f0_msg = validate_f0(f0)
-        if not f0_valid:
-            alerts.append(f"KKS F0 ERROR: {f0_msg}")
-        else:
-            alerts.append(f"KKS INFO: {f0_msg}")
+    alerts.append(f"KKS INFO: {parsed.message}")
+    alerts.extend(f"KKS WARNING: {a}" for a in parsed.alerts)
 
-    # Validate system family
-    if len(kks_upper) >= 4:
-        f1f2f3 = kks_upper[1:4]
-        family = get_system_family(f1f2f3)
-        if family:
-            alerts.append(f"KKS INFO: System family {f1f2f3[0]} = {family}")
-        elif f1f2f3[:2] in EQUIPMENT_PREFIXES:
-            alerts.append(f"KKS INFO: Equipment prefix {f1f2f3[:2]} recognized")
-        else:
-            alerts.append(
-                f"KKS WARNING: F1F2F3='{f1f2f3}' not in known system prefixes. "
-                f"Verify against Rooppur NPP system index."
-            )
-
-    # Check for room code pattern
-    if "R" in kks_upper[:6]:
-        room_valid, room_msg, room_details = validate_room_code(kks_upper)
-        if room_valid and room_details and room_details.get("is_shaft"):
-            alerts.append(f"KKS INFO: {room_msg}")
-        elif room_valid:
-            alerts.append(f"KKS INFO: Valid room code detected - {room_msg}")
-
-    # Check for A3 codes in longer KKS strings
-    if len(kks_upper) >= 8:
-        for a3_code, a3_data in A3_CODES.items():
-            if a3_code in kks_upper[7:]:
-                alerts.append(f"KKS INFO: A3 code '{a3_code}' detected: {a3_data}")
-
-    # Check equipment unit numbering (001-900 per Appendix B)
-    digits = "".join(c for c in kks_upper if c.isdigit())
-    if len(digits) >= 3:
-        potential_an = digits[:3]
-        if potential_an.isdigit():
-            an_val = int(potential_an)
-            if an_val > 900:
-                alerts.append(
-                    f"KKS WARNING: Equipment unit number {an_val} exceeds 900. "
-                    f"Per Appendix B, numbering is 001-900. Verify correctness."
-                )
-            elif an_val == 0:
-                alerts.append(
-                    f"KKS WARNING: Equipment unit number 000 is invalid. "
-                    f"Per Appendix B, numbering starts at 001."
-                )
+    if parsed.scope:
+        record["scope_type"] = parsed.scope.value
 
     return record, alerts
 
@@ -310,7 +287,7 @@ def post_process_kks_record(record: Dict[str, Any]) -> Tuple[Dict[str, Any], Lis
 
 def process_file_smart(file_bytes: bytes, file_name: str) -> Tuple[int, List[str]]:
     """
-    Incremental, idempotent file processing pipeline with Rooppur NPP KKS validation.
+    Incremental, idempotent file processing pipeline with real Rooppur NPP KKS validation.
 
     Args:
         file_bytes: Raw file bytes
@@ -319,7 +296,7 @@ def process_file_smart(file_bytes: bytes, file_name: str) -> Tuple[int, List[str
     Returns:
         (records_processed, list of all alert messages)
     """
-    all_alerts = []
+    all_alerts: List[str] = []
     total_processed = 0
 
     file_hash = hashlib.md5(file_bytes).hexdigest()
@@ -350,7 +327,7 @@ def process_file_smart(file_bytes: bytes, file_name: str) -> Tuple[int, List[str
             continue
 
         records = data.get("records", [])
-        if not records and all(k in data for k in ['system', 'system_kks', 'component']):
+        if not records and all(k in data for k in ('system', 'system_kks', 'component')):
             records = [data]
 
         st.info(f"Chunk {i+1}: Extracted {len(records)} record(s).")
@@ -358,12 +335,6 @@ def process_file_smart(file_bytes: bytes, file_name: str) -> Tuple[int, List[str
         for record in records:
             record, kks_alerts = post_process_kks_record(record)
             all_alerts.extend(kks_alerts)
-
-            kks = record.get('system_kks', '')
-            scope = get_kks_scope(kks)
-
-            if scope:
-                record['scope_type'] = scope.value
 
             dep_issues = validate_milestone_dependencies(record)
             all_alerts.extend(dep_issues)
@@ -389,7 +360,7 @@ def process_file_smart(file_bytes: bytes, file_name: str) -> Tuple[int, List[str
 def parse_shift_notes(notes_text: str) -> Tuple[List[Dict[str, Any]], List[str]]:
     """
     Parses natural language shift notes directly into structured records
-    with Rooppur NPP KKS validation.
+    with real Rooppur NPP KKS validation.
 
     Returns:
         (list of parsed records, list of alerts/warnings)
@@ -402,11 +373,11 @@ def parse_shift_notes(notes_text: str) -> Tuple[List[Dict[str, Any]], List[str]]
         return [], ["ERROR: AI extraction failed"]
 
     records = data.get("records", [])
-    if not records and all(k in data for k in ['system', 'system_kks', 'component']):
+    if not records and all(k in data for k in ('system', 'system_kks', 'component')):
         records = [data]
 
-    alerts = []
-    validated_records = []
+    alerts: List[str] = []
+    validated_records: List[Dict[str, Any]] = []
 
     for record in records:
         kks = record.get('system_kks', '')
@@ -415,11 +386,10 @@ def parse_shift_notes(notes_text: str) -> Tuple[List[Dict[str, Any]], List[str]]
         alerts.extend(kks_alerts)
 
         scope = get_kks_scope(kks)
-
         if scope is None:
             alerts.append(
                 f"WARNING: Unrecognized KKS '{kks}' in extracted record. "
-                f"Verify F0 prefix is present (mandatory per Rooppur NPP). Manual review required."
+                f"Verify the 2-digit Unit prefix is present (mandatory). Manual review required."
             )
         else:
             record['scope_type'] = scope.value
