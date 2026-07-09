@@ -522,14 +522,15 @@ with tab3:
         )
 
       # Dependency warning
-if pic_stat != "Completed" and ht_stat == "Completed":
-    warning_html = (
-        '<div class="alert-box alert-warning">'
-        '⚠️ <b>Dependency Warning / Предупреждение о зависимости:</b> HT is marked Completed but PIC is not. '
-        'PIC must precede HT per commissioning procedure.<br>'
-        'ГИ отмечено как Выполнено, но ПОМ не выполнено. ПОМ должна предшествовать ГИ.' 
-        '</div>'
-    )
+        if pic_stat != "Completed" and ht_stat == "Completed":
+            warning_html = (
+                '<div class="alert-box alert-warning">'
+                '⚠️ <b>Dependency Warning / Предупреждение о зависимости:</b> HT is marked Completed but PIC is not. '
+                'PIC must precede HT per commissioning procedure.<br>'
+                'ГИ отмечено как Выполнено, но ПОМ не выполнено. ПОМ должна предшествовать ГИ.' 
+                '</div>'
+            )
+            
             st.markdown(warning_html, unsafe_allow_html=True)
 
         st.markdown("---")
