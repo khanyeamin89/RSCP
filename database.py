@@ -5,8 +5,6 @@ All Supabase interactions with validation, error handling, and transaction safet
 
 KKS Coding based on Rooppur NPP document RPR-QM-AEB0001 Revision B05 (2017)
 "Agreement on Using the KKS Coding System" (VGB-B 105 E 2010, VGB-B 106 E 2004)
-
-Bilingual support: Russian (original document language) -> English translations
 """
 
 import streamlit as st
@@ -23,9 +21,6 @@ from config import (
     validate_a3,
     get_kks_scope,
     get_system_family,
-    get_system_family_ru,
-    get_bilingual_system_family,
-    enforce_scope_milestones,
     validate_milestone_dependencies,
     REGISTRY_SCHEMA,
     REGISTRY_UNIQUE_KEYS,
@@ -67,6 +62,25 @@ def load_registry_df() -> "pd.DataFrame":
     if not data:
         return pd.DataFrame(columns=list(REGISTRY_SCHEMA.keys()))
     return pd.DataFrame(data)
+
+
+def clear_registry() -> Tuple[bool, str]:
+    """
+    Clears ALL records from the registry table.
+    Use with extreme caution - this is irreversible.
+
+    Returns:
+        (success: bool, message: str)
+    """
+    try:
+        supabase = get_supabase_client()
+        # Delete all records from registry table
+        result = supabase.table("registry").delete().neq("system", "").execute()
+        return True, "Registry cleared successfully. All records removed."
+    except APIError as e:
+        return False, f"Database error clearing registry: {e.message}"
+    except Exception as e:
+        return False, f"Unexpected error clearing registry: {str(e)}"
 
 
 def upsert_registry_row(row: Dict[str, Any], skip_validation: bool = False) -> Tuple[bool, List[str]]:
@@ -111,12 +125,8 @@ def upsert_registry_row(row: Dict[str, Any], skip_validation: bool = False) -> T
         if len(kks) >= 4:
             f1f2f3 = kks[1:4].upper()
             family = get_system_family(f1f2f3)
-            family_ru = get_system_family_ru(f1f2f3)
             if family:
-                msg = f"KKS INFO: System family {f1f2f3[0]} = {family}"
-                if family_ru:
-                    msg += f" ({family_ru})"
-                messages.append(msg)
+                messages.append(f"KKS INFO: System family {f1f2f3[0]} = {family}")
 
         # Check for room code
         if 'R' in kks[:6].upper():
@@ -129,14 +139,10 @@ def upsert_registry_row(row: Dict[str, Any], skip_validation: bool = False) -> T
             for a3_code, a3_data in A3_CODES.items():
                 if a3_code in kks[7:].upper():
                     messages.append(
-                        f"KKS INFO: A3 code '{a3_code}' detected: {a3_data['en']} ({a3_data['ru']})"
+                        f"KKS INFO: A3 code '{a3_code}' detected: {a3_data}"
                     )
 
-    # --- Step 3: Enforce scope-based milestone rules ---
-    row, scope_alerts = enforce_scope_milestones(row)
-    messages.extend(scope_alerts)
-
-    # --- Step 4: Check milestone dependencies ---
+    # --- Step 3: Check milestone dependencies ---
     dep_violations = validate_milestone_dependencies(row)
     if dep_violations:
         for v in dep_violations:
@@ -145,7 +151,7 @@ def upsert_registry_row(row: Dict[str, Any], skip_validation: bool = False) -> T
         for v in dep_violations:
             st.markdown(f'<div class="alert-box alert-warning">{v}</div>', unsafe_allow_html=True)
 
-    # --- Step 5: Ensure all schema fields exist (fill missing with defaults) ---
+    # --- Step 4: Ensure all schema fields exist (fill missing with defaults) ---
     clean_row = {}
     for field, field_type in REGISTRY_SCHEMA.items():
         val = row.get(field)
@@ -157,7 +163,7 @@ def upsert_registry_row(row: Dict[str, Any], skip_validation: bool = False) -> T
         else:
             clean_row[field] = str(val) if field_type == str else val
 
-    # --- Step 6: Execute upsert ---
+    # --- Step 5: Execute upsert ---
     try:
         supabase = get_supabase_client()
         result = supabase.table("registry").upsert(
@@ -226,7 +232,7 @@ def mark_chunk_done(file_hash: str, chunk_index: int) -> bool:
 
 def upsert_registry_batch(records: List[Dict[str, Any]]) -> Tuple[int, List[str]]:
     """
-    Batch upsert with per-record validation and scope enforcement.
+    Batch upsert with per-record validation.
     Returns (success_count, list of all messages).
     """
     success_count = 0
