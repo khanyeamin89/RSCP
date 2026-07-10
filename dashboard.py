@@ -157,22 +157,21 @@ def _status_to_dot_color(status: str) -> str:
 
 
 def render_date_timeline(points: List[Dict[str, Any]], title: str = "",
-                          fig_width: float = 14, fig_height: float = 4.5) -> plt.Figure:
+                          fig_width: float = 14, fig_height: float = 3.2) -> plt.Figure:
     """
     Horizontal timeline: a single continuous line with circular markers placed
-    precisely above each point's own date, a short label on/next to each
-    circle, and status color-coding (green=Pass, red=Fail, yellow=Ongoing,
-    gray=Postponed/unknown).
+    precisely on the line above each point's own date. The short label sits
+    inside the circle, and the date sits directly beneath it — no offset
+    stems, everything anchored right at the point itself. Status color-coding:
+    green=Pass, red=Fail, yellow=Ongoing, gray=Postponed/unknown.
 
     Args:
-        points: list of {"date": datetime.date, "label": str, "status": str,
-                          "tooltip": str (optional, full description)}
+        points: list of {"date": datetime.date, "label": str, "status": str}
                 Only points with a real date are plotted; caller should filter
                 out/handle missing dates (e.g. via manual entry) beforehand.
         title: chart title
     """
     import matplotlib.dates as mdates
-    from datetime import date as _date
 
     fig, ax = plt.subplots(figsize=(fig_width, fig_height))
 
@@ -187,29 +186,24 @@ def render_date_timeline(points: List[Dict[str, Any]], title: str = "",
     valid_points = sorted(valid_points, key=lambda p: p["date"])
     dates = [p["date"] for p in valid_points]
 
-    # The single continuous horizontal line
+    # The single continuous horizontal line, all points sit directly on it
     ax.plot([dates[0], dates[-1]], [0, 0], color="#cbd5e1", linewidth=2.5, zorder=1,
             solid_capstyle="round")
 
-    # Alternate label offset above/below the line to reduce overlap when
-    # dates are close together
-    for i, p in enumerate(valid_points):
+    for p in valid_points:
         color = _status_to_dot_color(p.get("status", ""))
         d = p["date"]
-
-        ax.scatter([d], [0], s=420, color=color, edgecolor="white", linewidth=2, zorder=3)
-
         label = p.get("label", "")
-        offset = 0.35 if i % 2 == 0 else -0.35
-        va = "bottom" if offset > 0 else "top"
-        ax.plot([d, d], [0, offset], color="#cbd5e1", linewidth=1, zorder=2, linestyle=":")
-        ax.text(d, offset, label, ha="center", va=va, fontsize=10, fontweight="bold", color="#1e293b")
-        # Date directly on/under the circle
-        ax.text(d, -0.12 if offset > 0 else 0.12, d.strftime("%d %b %Y"),
-                ha="center", va="top" if offset > 0 else "bottom",
-                fontsize=7.5, color="#64748b", rotation=0)
 
-    ax.set_ylim(-1.1, 1.1)
+        ax.scatter([d], [0], s=650, color=color, edgecolor="white", linewidth=2, zorder=3)
+        # Label inside the circle
+        ax.text(d, 0, label, ha="center", va="center", fontsize=9, fontweight="bold",
+                 color="white", zorder=4)
+        # Date directly beneath the same point
+        ax.text(d, -0.28, d.strftime("%d %b %Y"), ha="center", va="top",
+                 fontsize=8, color="#334155", zorder=4)
+
+    ax.set_ylim(-0.6, 0.6)
     ax.set_yticks([])
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%d %b %Y"))
     fig.autofmt_xdate(rotation=30, ha="right")
@@ -219,7 +213,7 @@ def render_date_timeline(points: List[Dict[str, Any]], title: str = "",
     ax.spines["bottom"].set_color("#cbd5e1")
 
     if title:
-        ax.set_title(title, fontsize=13, fontweight="bold", pad=20, color="#0f172a")
+        ax.set_title(title, fontsize=13, fontweight="bold", pad=16, color="#0f172a")
 
     legend_patches = [
         mpatches.Patch(color="#22c55e", label="Pass / Completed"),
@@ -227,7 +221,7 @@ def render_date_timeline(points: List[Dict[str, Any]], title: str = "",
         mpatches.Patch(color="#eab308", label="Ongoing / In Progress"),
         mpatches.Patch(color="#94a3b8", label="Postponed / Pending"),
     ]
-    ax.legend(handles=legend_patches, loc="upper center", bbox_to_anchor=(0.5, -0.28),
+    ax.legend(handles=legend_patches, loc="upper center", bbox_to_anchor=(0.5, -0.35),
               ncol=4, fontsize=9, frameon=False)
 
     plt.tight_layout()
