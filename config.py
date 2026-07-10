@@ -910,6 +910,18 @@ MILESTONE_LABELS: Dict[str, str] = {
 
 MILESTONES: List[str] = ["it_status", "pic_status", "ht_status", "pt_status", "saw_status"]
 
+# Each milestone's companion date field (target/completion date for that test).
+# Dates are plain "YYYY-MM-DD" strings (or "" if unknown) — kept as str in the
+# schema so partial/unknown dates never break validation; parsing to real
+# dates happens only where a chart needs it.
+MILESTONE_DATE_FIELDS: Dict[str, str] = {
+    "it_status": "it_date",
+    "pic_status": "pic_date",
+    "ht_status": "ht_date",
+    "pt_status": "pt_date",
+    "saw_status": "saw_date",
+}
+
 # Valid status values for any milestone
 VALID_STATUSES: Set[str] = {"Pending", "In Progress", "Completed", "Failed", "N/A", "Not Applicable"}
 
@@ -938,10 +950,15 @@ REGISTRY_SCHEMA: Dict[str, type] = {
     "scope_type": str,
     "component": str,
     "it_status": str,
+    "it_date": str,
     "pic_status": str,
+    "pic_date": str,
     "ht_status": str,
+    "ht_date": str,
     "pt_status": str,
+    "pt_date": str,
     "saw_status": str,
+    "saw_date": str,
     "comments": str,
 }
 
