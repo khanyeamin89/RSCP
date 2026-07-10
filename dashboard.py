@@ -66,6 +66,29 @@ from ai_engine import process_file_smart, parse_shift_notes
 # TIMELINE CHART HELPER
 # =============================================================================
 
+def _records_to_clean_df(records: List[Dict[str, Any]], schema: Dict[str, type]) -> pd.DataFrame:
+    """
+    Converts a list of AI-extracted dicts into a DataFrame safe for
+    st.data_editor. AI-extracted records don't always have the same set of
+    keys (one record might have "commissioning_stage", another might not) —
+    pd.DataFrame() on ragged dicts fills the gaps with NaN (a float) sitting
+    in an otherwise string column. That mixed str/float column can crash
+    PyArrow's serialization (segfault, not a catchable Python exception) when
+    Streamlit tries to send it to the frontend.
+
+    This guarantees every record has every schema field present, as a plain
+    string, before a DataFrame is ever built.
+    """
+    normalized = []
+    for rec in records:
+        clean = {}
+        for field in schema:
+            val = rec.get(field, "")
+            clean[field] = "" if val is None else str(val)
+        normalized.append(clean)
+    return pd.DataFrame(normalized, columns=list(schema.keys()))
+
+
 def _status_to_dot_color(status: str) -> str:
     """
     Maps a status string to the 4-color scheme requested for the date-based
@@ -289,7 +312,7 @@ with tab1:
                     pivot_df = chart_df.pivot(index='Milestone', columns='Status', values='Count').fillna(0)
                     col_order = ['Completed', 'In Progress', 'Pending', 'Failed', 'N/A']
                     pivot_df = pivot_df[[c for c in col_order if c in pivot_df.columns]]
-                    st.bar_chart(pivot_df, use_container_width=True, height=400)
+                    st.bar_chart(pivot_df, width="stretch", height=400)
                 else:
                     st.info("No milestone data to display.")
 
@@ -300,7 +323,7 @@ with tab1:
                 scope_counts.columns = ['Scope', 'Count']
                 st.bar_chart(
                     scope_counts.set_index('Scope'),
-                    use_container_width=True,
+                    width="stretch",
                     height=400
                 )
 
@@ -322,7 +345,7 @@ with tab1:
             family_counts.columns = ['System Family', 'Count']
             st.bar_chart(
                 family_counts.set_index('System Family'),
-                use_container_width=True,
+                width="stretch",
                 height=300
             )
 
@@ -357,13 +380,13 @@ with tab1:
 
         st.dataframe(
             display_df[display_cols],
-            use_container_width=True,
+            width="stretch",
             hide_index=True
         )
 
         # Quick action: navigate to editor
         st.markdown("---")
-        if st.button("Go to Registry Editor to edit records", type="primary", use_container_width=True):
+        if st.button("Go to Registry Editor to edit records", type="primary", width="stretch"):
             st.session_state.show_editor = True
             st.rerun()
 
@@ -396,7 +419,7 @@ with tab2:
         )
         col1, col2 = st.columns([1, 3])
         with col1:
-            process_btn = st.button("Run Token-Efficient Sync", type="primary", use_container_width=True)
+            process_btn = st.button("Run Token-Efficient Sync", type="primary", width="stretch")
 
         if process_btn:
             with st.spinner("Processing file with Rooppur NPP KKS validation..."):
@@ -451,7 +474,7 @@ with tab3:
         search_component = st.text_input("Component Tag", key="search_comp", placeholder="e.g., Pump-001")
     with search_col3:
         st.markdown("<br>", unsafe_allow_html=True)
-        load_btn = st.button("Load", use_container_width=True)
+        load_btn = st.button("Load", width="stretch")
 
     # Pre-populate form if record found
     prefill = {}
@@ -592,7 +615,7 @@ with tab3:
             st.markdown(warning_html, unsafe_allow_html=True)
 
         st.markdown("---")
-        submitted = st.form_submit_button("Submit Record", use_container_width=True, type="primary")
+        submitted = st.form_submit_button("Submit Record", width="stretch", type="primary")
 
         if submitted:
             if not sys_name or not kks_code or not comp_tag:
@@ -655,7 +678,7 @@ with tab4:
         placeholder="Example: 10JAA10AP001 feedwater pump IT completed, Stage A-1. PIC in progress due to debris found in strainer. 10JEB20 condensate system HT passed, awaiting SAW scheduling. Interlock on 10JAA20 actuated at 14:20 due to low flow — under investigation."
     )
 
-    if st.button("Parse & Validate", type="primary", use_container_width=True) and notes_text.strip():
+    if st.button("Parse & Validate", type="primary", width="stretch") and notes_text.strip():
         with st.spinner("AI analyzing shift notes with Rooppur NPP KKS rules..."):
             records, ppia_events, alerts = parse_shift_notes(notes_text)
         st.session_state["sn_parsed_records"] = records
@@ -678,8 +701,8 @@ with tab4:
         st.success(f"Extracted {len(parsed_records)} commissioning record(s). Edit any cell below before committing.")
         st.subheader("Commissioning Records — Editable Preview")
         edited_records_df = st.data_editor(
-            pd.DataFrame(parsed_records),
-            use_container_width=True,
+            _records_to_clean_df(parsed_records, REGISTRY_SCHEMA),
+            width="stretch",
             hide_index=True,
             num_rows="dynamic",
             key="sn_records_editor",
@@ -689,8 +712,8 @@ with tab4:
         st.success(f"Extracted {len(parsed_ppia)} PPIA event(s). Edit any cell below before committing.")
         st.subheader("PPIA Events — Editable Preview")
         edited_ppia_df = st.data_editor(
-            pd.DataFrame(parsed_ppia),
-            use_container_width=True,
+            _records_to_clean_df(parsed_ppia, PPIA_LOG_SCHEMA),
+            width="stretch",
             hide_index=True,
             num_rows="dynamic",
             key="sn_ppia_editor",
@@ -716,7 +739,7 @@ with tab4:
         col_a, col_b = st.columns(2)
         with col_a:
             if edited_records_df is not None and st.button(
-                "Commit Records to Registry", type="primary", use_container_width=True
+                "Commit Records to Registry", type="primary", width="stretch"
             ):
                 edited_records = edited_records_df.to_dict("records")
                 success, all_msgs = upsert_registry_batch(edited_records)
@@ -727,7 +750,7 @@ with tab4:
                 st.rerun()
         with col_b:
             if edited_ppia_df is not None and st.button(
-                "Commit PPIA Events to Log", type="primary", use_container_width=True
+                "Commit PPIA Events to Log", type="primary", width="stretch"
             ):
                 edited_events = edited_ppia_df.to_dict("records")
                 success, all_msgs = insert_ppia_batch(edited_events)
@@ -865,7 +888,7 @@ with tab5:
             column_config=column_config,
             disabled=[c for c in display_cols if c not in editable_cols or c == 'scope_type'],
             hide_index=True,
-            use_container_width=True,
+            width="stretch",
             key=editor_key,
             num_rows="fixed",
         )
@@ -898,7 +921,7 @@ with tab5:
 
             if changes_detected:
                 st.markdown("---")
-                if st.button("Save Changes to Database", type="primary", use_container_width=True):
+                if st.button("Save Changes to Database", type="primary", width="stretch"):
                     saved_count = 0
                     error_count = 0
 
@@ -941,7 +964,7 @@ with tab5:
 
         selection = st.dataframe(
             filtered_df[display_cols],
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
             on_select="rerun",
             selection_mode="single-row",
@@ -1023,7 +1046,7 @@ with tab5:
                 if edit_pic != "Completed" and edit_ht == "Completed":
                     st.warning("Dependency Warning: PIC must precede HT")
 
-                if st.form_submit_button("Update Record", type="primary", use_container_width=True):
+                if st.form_submit_button("Update Record", type="primary", width="stretch"):
                     updated_record = {
                         "system": edit_system,
                         "system_kks": edit_kks,
@@ -1209,7 +1232,7 @@ with tab7:
     st.markdown("#### Unit Codes (mandatory 2-digit prefix)")
     sorted_units = sort_by_label(UNIT_CODES) if sort_by == "label" else sorted(UNIT_CODES.items())
     unit_df = pd.DataFrame([{"Unit": k, "Description": v} for k, v in sorted_units])
-    st.dataframe(unit_df, use_container_width=True, hide_index=True)
+    st.dataframe(unit_df, width="stretch", hide_index=True)
     st.caption("Other 2-digit codes (e.g. 05, 11-15, 17) denote auxiliary/shared facility zones.")
 
     st.markdown("---")
@@ -1218,7 +1241,7 @@ with tab7:
     st.markdown("#### Function Key Legend (1st letter of System code)")
     sorted_fkeys = sort_by_label(FUNCTION_KEY_LEGEND) if sort_by == "label" else sorted(FUNCTION_KEY_LEGEND.items())
     fkey_df = pd.DataFrame([{"Function Key": k, "Description": v} for k, v in sorted_fkeys])
-    st.dataframe(fkey_df, use_container_width=True, hide_index=True)
+    st.dataframe(fkey_df, width="stretch", hide_index=True)
 
     st.markdown("---")
 
@@ -1226,7 +1249,7 @@ with tab7:
     st.markdown("#### Equipment Type Legend (2-letter type code)")
     sorted_types = sort_by_label(EQUIPMENT_TYPE_LEGEND) if sort_by == "label" else sorted(EQUIPMENT_TYPE_LEGEND.items())
     type_df = pd.DataFrame([{"Type Code": k, "Description": v} for k, v in sorted_types])
-    st.dataframe(type_df, use_container_width=True, hide_index=True)
+    st.dataframe(type_df, width="stretch", hide_index=True)
 
     st.markdown("---")
 
@@ -1239,7 +1262,7 @@ with tab7:
     if sys_search:
         mask = sys_df["System Code"].str.contains(sys_search, case=False, na=False) | sys_df["Description"].str.contains(sys_search, case=False, na=False)
         sys_df = sys_df[mask]
-    st.dataframe(sys_df, use_container_width=True, hide_index=True, height=300)
+    st.dataframe(sys_df, width="stretch", hide_index=True, height=300)
 
     st.markdown("---")
 
@@ -1251,7 +1274,7 @@ with tab7:
     if bld_search:
         mask = bld_df["Building Code"].str.contains(bld_search, case=False, na=False) | bld_df["Description"].str.contains(bld_search, case=False, na=False)
         bld_df = bld_df[mask]
-    st.dataframe(bld_df, use_container_width=True, hide_index=True, height=300)
+    st.dataframe(bld_df, width="stretch", hide_index=True, height=300)
 
     st.markdown("---")
 
@@ -1266,7 +1289,7 @@ with tab7:
             "Description": v,
         })
     ms_df = pd.DataFrame(ms_data)
-    st.dataframe(ms_df, use_container_width=True, hide_index=True)
+    st.dataframe(ms_df, width="stretch", hide_index=True)
 
     st.markdown("---")
 
@@ -1279,7 +1302,7 @@ with tab7:
             "Description": v,
         })
     status_df = pd.DataFrame(status_data)
-    st.dataframe(status_df, use_container_width=True, hide_index=True)
+    st.dataframe(status_df, width="stretch", hide_index=True)
 
     st.markdown("---")
 
@@ -1345,7 +1368,7 @@ with tab8:
         confirm_text = st.text_input("Confirmation", key="confirm_text", placeholder="Type DELETE ALL")
 
         if confirm_text == "DELETE ALL":
-            if st.button("PERMANENTLY CLEAR REGISTRY", type="primary", use_container_width=True):
+            if st.button("PERMANENTLY CLEAR REGISTRY", type="primary", width="stretch"):
                 with st.spinner("Clearing registry..."):
                     success, message = clear_registry()
 
@@ -1371,7 +1394,7 @@ with tab8:
     just use the "Force reprocess" checkbox on the Import tab for a one-off re-run.
     """)
 
-    if st.button("Clear Chunk Cache (all files)", use_container_width=True):
+    if st.button("Clear Chunk Cache (all files)", width="stretch"):
         with st.spinner("Clearing chunk cache..."):
             success, message = clear_processed_chunks()
         if success:
@@ -1434,7 +1457,7 @@ with tab9:
                 filtered_ppia = filtered_ppia[mask]
 
         st.markdown(f"**Showing {len(filtered_ppia)} of {len(ppia_df)} events**")
-        st.dataframe(filtered_ppia, use_container_width=True, hide_index=True)
+        st.dataframe(filtered_ppia, width="stretch", hide_index=True)
 
     st.markdown("---")
     st.markdown("#### Log a PPIA Event Manually")
@@ -1456,7 +1479,7 @@ with tab9:
 
         ppia_comments = st.text_area("Additional Comments")
 
-        ppia_submitted = st.form_submit_button("Log PPIA Event", type="primary", use_container_width=True)
+        ppia_submitted = st.form_submit_button("Log PPIA Event", type="primary", width="stretch")
 
         if ppia_submitted:
             if not ppia_description.strip():
