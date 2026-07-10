@@ -130,6 +130,36 @@ def _wait_for_rate_limit_slot() -> None:
     _last_ai_call_time = time.monotonic()
 
 
+def _salvage_truncated_json(content: str) -> Optional[Dict[str, Any]]:
+    """
+    Attempts to recover a usable {"records": [...]} dict from a response that
+    got cut off mid-record (hit the output token limit before finishing).
+    Works backward from the end of the string, trying to close the JSON right
+    after each complete '}' — the first one that parses cleanly means
+    everything up to (and including) that record is intact; whatever was
+    being written after it gets dropped.
+
+    Returns None if no valid "records" array can be recovered at all.
+    """
+    import re
+
+    idx_records = content.find('"records"')
+    if idx_records == -1:
+        return None
+    idx_bracket = content.find('[', idx_records)
+    if idx_bracket == -1:
+        return None
+
+    candidate_positions = [m.start() for m in re.finditer(r'\}', content) if m.start() > idx_bracket]
+    for pos in reversed(candidate_positions):
+        truncated = content[:pos + 1] + ']}'
+        try:
+            return json.loads(truncated)
+        except json.JSONDecodeError:
+            continue
+    return None
+
+
 def ask_mistral(prompt: str, max_retries: int = 5) -> Optional[Dict[str, Any]]:
     """
     Mistral La Plateforme API wrapper with JSON enforcement, retry logic, and
@@ -168,7 +198,7 @@ def ask_mistral(prompt: str, max_retries: int = 5) -> Optional[Dict[str, Any]]:
         ],
         "response_format": {"type": "json_object"},
         "temperature": 0.1,
-        "max_tokens": 4000
+        "max_tokens": 8000
     }
 
     headers = {
@@ -241,6 +271,15 @@ def ask_mistral(prompt: str, max_retries: int = 5) -> Optional[Dict[str, Any]]:
             st.error(f"Mistral API HTTP Error ({status}): {str(e)}")
             return None
         except json.JSONDecodeError as e:
+            salvaged = _salvage_truncated_json(content) if 'content' in locals() else None
+            if salvaged is not None:
+                st.warning(
+                    "Mistral's response was cut off (likely hit the output token limit "
+                    "before finishing). Recovered the complete records before the cutoff — "
+                    "the last, incomplete record in this chunk was dropped. If this happens "
+                    "often, the file may need smaller chunks."
+                )
+                return salvaged
             st.error(f"Mistral returned invalid JSON: {str(e)}")
             return None
         except requests.exceptions.RequestException as e:
@@ -284,7 +323,7 @@ def extract_text_from_file(file_bytes: bytes, file_name: str) -> str:
         return file_bytes.decode('utf-8', errors='ignore')
 
 
-def smart_chunk_text(text: str, max_chunk_size: int = 15000) -> List[str]:
+def smart_chunk_text(text: str, max_chunk_size: int = 8000) -> List[str]:
     """
     Chunks text intelligently by trying to preserve record boundaries.
     Falls back to character-based chunking if no clear boundaries found.
