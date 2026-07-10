@@ -42,6 +42,10 @@ from config import (
     BUILDING_CODES,
     SYSTEM_CODES,
     REGISTRY_SCHEMA,
+    PPIA_LOG_SCHEMA,
+    PPIA_STATUSES,
+    parse_commissioning_stage,
+    commissioning_stage_sort_key,
 )
 from database import (
     load_registry,
@@ -51,92 +55,16 @@ from database import (
     upsert_registry_batch,
     clear_registry,
     clear_processed_chunks,
+    load_ppia_log,
+    load_ppia_log_df,
+    insert_ppia_batch,
+    clear_ppia_log,
 )
 from ai_engine import process_file_smart, parse_shift_notes
 
 # =============================================================================
 # TIMELINE CHART HELPER
 # =============================================================================
-
-def render_milestone_timeline(record: Dict[str, Any], fig_width: float = 12, fig_height: float = 4) -> plt.Figure:
-    """
-    Renders a horizontal Gantt-style timeline for a single record's milestones.
-
-    Milestones shown in commissioning order: IT -> PIC -> HT -> PT -> SAW
-    Status colors:
-        Completed  = #22c55e (green)
-        In Progress = #eab308 (yellow/amber)
-        Failed     = #ef4444 (red)
-        Pending    = #94a3b8 (slate gray)
-        N/A        = #e2e8f0 (light gray)
-    """
-    milestones = ["it_status", "pic_status", "ht_status", "pt_status", "saw_status"]
-    labels = [MILESTONE_LABELS.get(m, m).replace(" (", "\n(").replace("_status", "").upper() for m in milestones]
-
-    status_colors = {
-        "completed": "#22c55e",
-        "in progress": "#eab308",
-        "failed": "#ef4444",
-        "pending": "#94a3b8",
-        "n/a": "#e2e8f0",
-        "not applicable": "#e2e8f0",
-    }
-
-    status_order = {"completed": 4, "in progress": 3, "failed": 2, "pending": 1, "n/a": 0, "not applicable": 0}
-
-    fig, ax = plt.subplots(figsize=(fig_width, fig_height))
-
-    y_positions = range(len(milestones))
-    bar_height = 0.5
-
-    for i, ms in enumerate(milestones):
-        status = str(record.get(ms, "Pending")).strip().lower()
-        color = status_colors.get(status, "#94a3b8")
-
-        # Draw the milestone bar spanning the full width
-        ax.barh(i, 1.0, height=bar_height, color=color, edgecolor="white", linewidth=1.5, alpha=0.9)
-
-        # Add status text inside the bar
-        display_status = status.title() if status != "n/a" else "N/A"
-        text_color = "white" if status in ("completed", "failed") else "#1e293b"
-        ax.text(0.5, i, display_status, ha="center", va="center", 
-                fontsize=11, fontweight="bold", color=text_color)
-
-    # Y-axis: milestone names
-    ax.set_yticks(list(y_positions))
-    ax.set_yticklabels(labels, fontsize=10, fontweight="600")
-
-    # X-axis: hidden (just a visual container)
-    ax.set_xlim(0, 1)
-    ax.set_xticks([])
-    ax.set_xticklabels([])
-
-    # Remove spines
-    for spine in ["top", "right", "bottom", "left"]:
-        ax.spines[spine].set_visible(False)
-
-    # Title
-    kks = record.get("system_kks", "N/A")
-    system = record.get("system", "Unknown")
-    component = record.get("component", "Unknown")
-    scope = record.get("scope_type", "Unknown")
-    ax.set_title(f"{kks}  |  {system}  /  {component}  |  Scope: {scope}", 
-                 fontsize=13, fontweight="bold", pad=15, color="#0f172a")
-
-    # Legend
-    legend_patches = [
-        mpatches.Patch(color="#22c55e", label="Completed"),
-        mpatches.Patch(color="#eab308", label="In Progress"),
-        mpatches.Patch(color="#ef4444", label="Failed"),
-        mpatches.Patch(color="#94a3b8", label="Pending"),
-        mpatches.Patch(color="#e2e8f0", label="N/A"),
-    ]
-    ax.legend(handles=legend_patches, loc="upper right", fontsize=9, 
-              frameon=True, fancybox=True, shadow=True)
-
-    plt.tight_layout()
-    return fig
-
 
 def _status_to_dot_color(status: str) -> str:
     """
@@ -228,89 +156,6 @@ def render_date_timeline(points: List[Dict[str, Any]], title: str = "",
     return fig
 
 
-def render_multi_timeline(records: List[Dict[str, Any]], fig_width: float = 14, fig_height_per_record: float = 1.2) -> plt.Figure:
-    """
-    Renders a multi-record timeline comparison chart.
-    Each record gets a row group with its 5 milestones as colored bars.
-    """
-    if not records:
-        fig, ax = plt.subplots(figsize=(fig_width, 2))
-        ax.text(0.5, 0.5, "No records selected", ha="center", va="center", fontsize=14)
-        ax.axis("off")
-        return fig
-
-    milestones = ["it_status", "pic_status", "ht_status", "pt_status", "saw_status"]
-    ms_short = ["IT", "PIC", "HT", "PT", "SAW"]
-
-    status_colors = {
-        "completed": "#22c55e",
-        "in progress": "#eab308",
-        "failed": "#ef4444",
-        "pending": "#94a3b8",
-        "n/a": "#e2e8f0",
-        "not applicable": "#e2e8f0",
-    }
-
-    n_records = len(records)
-    n_milestones = len(milestones)
-    fig_height = max(4, n_records * fig_height_per_record + 1.5)
-
-    fig, ax = plt.subplots(figsize=(fig_width, fig_height))
-
-    bar_height = 0.35
-    group_gap = 0.15
-
-    y_tick_labels = []
-    y_tick_positions = []
-
-    for r_idx, record in enumerate(records):
-        group_center = r_idx * (n_milestones * bar_height + group_gap + 0.3)
-        kks = record.get("system_kks", "N/A")
-        component = record.get("component", "N/A")
-
-        for m_idx, ms in enumerate(milestones):
-            status = str(record.get(ms, "Pending")).strip().lower()
-            color = status_colors.get(status, "#94a3b8")
-            y_pos = group_center + m_idx * bar_height
-
-            ax.barh(y_pos, 1.0, height=bar_height, color=color, 
-                    edgecolor="white", linewidth=0.5, alpha=0.9)
-
-            display_status = status.title() if status != "n/a" else "N/A"
-            text_color = "white" if status in ("completed", "failed") else "#1e293b"
-            ax.text(0.5, y_pos, display_status, ha="center", va="center",
-                    fontsize=8, fontweight="bold", color=text_color)
-
-        # Label for this record group
-        label_y = group_center + (n_milestones * bar_height) / 2 - bar_height / 2
-        y_tick_positions.append(label_y)
-        y_tick_labels.append(f"{kks}\n{component}")
-
-    ax.set_yticks(y_tick_positions)
-    ax.set_yticklabels(y_tick_labels, fontsize=9, fontweight="600")
-    ax.set_xlim(0, 1)
-    ax.set_xticks([])
-    ax.set_xticklabels([])
-
-    for spine in ["top", "right", "bottom", "left"]:
-        ax.spines[spine].set_visible(False)
-
-    ax.set_title("Commissioning Milestone Timeline by KKS", 
-                 fontsize=14, fontweight="bold", pad=15, color="#0f172a")
-
-    legend_patches = [
-        mpatches.Patch(color="#22c55e", label="Completed"),
-        mpatches.Patch(color="#eab308", label="In Progress"),
-        mpatches.Patch(color="#ef4444", label="Failed"),
-        mpatches.Patch(color="#94a3b8", label="Pending"),
-        mpatches.Patch(color="#e2e8f0", label="N/A"),
-    ]
-    ax.legend(handles=legend_patches, loc="upper right", fontsize=9,
-              frameon=True, fancybox=True, shadow=True)
-
-    plt.tight_layout()
-    return fig
-
 
 # =============================================================================
 # PAGE SETUP
@@ -356,7 +201,7 @@ with st.sidebar:
 # TABS
 # =============================================================================
 
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
     "Analytics Dashboard",
     "Data Import & Sync",
     "Manual/Field Updates",
@@ -365,6 +210,7 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
     "Timeline View",
     "KKS Reference",
     "Admin",
+    "PPIA Log",
 ])
 
 # =============================================================================
@@ -659,6 +505,12 @@ with tab3:
                 disabled=True,
                 help=scope_details if scope_details else "Auto-detected from KKS prefix"
             )
+            stage_input = st.text_input(
+                "Commissioning Stage",
+                value=prefill.get('commissioning_stage', ''),
+                placeholder="e.g. A, A-1, B-2",
+                help="Letter, optionally with a dash and sub-stage number (A, A-1, B-2, ...)"
+            )
 
         # Show KKS validation details (single source of truth: config.parse_kks)
         if kks_code:
@@ -751,10 +603,17 @@ with tab3:
                 if not valid:
                     st.error(f"KKS Validation Failed: {msg}")
                 else:
+                    normalized_stage = parse_commissioning_stage(stage_input) if stage_input else ""
+                    if stage_input and not normalized_stage:
+                        st.warning(
+                            f"Commissioning stage '{stage_input}' doesn't match the expected format "
+                            f"(a letter, optionally with a dash and number, e.g. 'A', 'A-1') — saved as-is."
+                        )
                     record = {
                         "system": sys_name,
                         "system_kks": kks_code,
                         "component": comp_tag,
+                        "commissioning_stage": normalized_stage or stage_input,
                         "it_status": it_stat,
                         "pic_status": pic_stat,
                         "ht_status": ht_stat,
@@ -784,57 +643,99 @@ with tab4:
     st.subheader("Natural Language Shift Note Parser")
     st.markdown("""
     Paste raw shift notes, field observations, or handover logs.
-    The AI will extract structured commissioning data, validate KKS codes per Rooppur NPP rules,
-    and flag any milestone dependency violations.
+    The AI extracts structured commissioning data (validated against Rooppur NPP KKS rules,
+    with milestone dependency checks) and separately flags any **PPIA** (Process Protection
+    and Interlock Actuation) events mentioned. **Review and edit both tables below before
+    committing** — nothing is saved until you click a Commit button.
     """)
 
     notes_text = st.text_area(
         "Shift Notes",
         height=250,
-        placeholder="Example: 10JAA10AP001 feedwater pump IT completed. PIC in progress due to debris found in strainer. 10JEB20 condensate system HT passed, awaiting SAW scheduling. Building 10UJA lighting inspection done."
+        placeholder="Example: 10JAA10AP001 feedwater pump IT completed, Stage A-1. PIC in progress due to debris found in strainer. 10JEB20 condensate system HT passed, awaiting SAW scheduling. Interlock on 10JAA20 actuated at 14:20 due to low flow — under investigation."
     )
 
-    parse_label = "Parse & Validate"
-    if st.button(parse_label, type="primary", use_container_width=True) and notes_text.strip():
+    if st.button("Parse & Validate", type="primary", use_container_width=True) and notes_text.strip():
         with st.spinner("AI analyzing shift notes with Rooppur NPP KKS rules..."):
-            records, alerts = parse_shift_notes(notes_text)
+            records, ppia_events, alerts = parse_shift_notes(notes_text)
+        st.session_state["sn_parsed_records"] = records
+        st.session_state["sn_parsed_ppia"] = ppia_events
+        st.session_state["sn_alerts"] = alerts
 
-        if records:
-            st.success(f"Extracted {len(records)} record(s) from shift notes.")
+    parsed_records = st.session_state.get("sn_parsed_records", [])
+    parsed_ppia = st.session_state.get("sn_parsed_ppia", [])
+    parsed_alerts = st.session_state.get("sn_alerts", [])
 
-            # Preview table
-            preview_df = pd.DataFrame(records)
-            st.subheader("Extracted Records Preview")
-            st.dataframe(preview_df, use_container_width=True, hide_index=True)
+    if not parsed_records and not parsed_ppia and "sn_alerts" in st.session_state:
+        st.error("Could not extract any valid records or PPIA events from the provided notes.")
+        for alert in parsed_alerts:
+            st.error(alert)
 
-            # Alerts
-            if alerts:
-                with st.expander(f"Validation Alerts ({len(alerts)})", expanded=True):
-                    for alert in alerts:
-                        if "DEPENDENCY" in alert:
-                            st.markdown(
-                                f'<div class="alert-box alert-error">{alert}</div>',
-                                unsafe_allow_html=True
-                            )
-                        elif alert.startswith("KKS INFO"):
-                            st.success(alert)
-                        elif alert.startswith("KKS WARNING") or alert.startswith("KKS ERROR"):
-                            st.error(alert)
-                        else:
-                            st.write(alert)
+    edited_records_df = None
+    edited_ppia_df = None
 
-            # Commit option
-            st.markdown("---")
-            if st.button("Commit All to Registry", type="primary", use_container_width=True):
-                success, all_msgs = upsert_registry_batch(records)
-                st.success(f"Committed {success}/{len(records)} records to registry.")
-                if success < len(records):
-                    st.warning("Some records failed validation. Check logs above.")
-        else:
-            st.error("Could not extract any valid records from the provided notes.")
-            if alerts:
-                for alert in alerts:
+    if parsed_records:
+        st.success(f"Extracted {len(parsed_records)} commissioning record(s). Edit any cell below before committing.")
+        st.subheader("Commissioning Records — Editable Preview")
+        edited_records_df = st.data_editor(
+            pd.DataFrame(parsed_records),
+            use_container_width=True,
+            hide_index=True,
+            num_rows="dynamic",
+            key="sn_records_editor",
+        )
+
+    if parsed_ppia:
+        st.success(f"Extracted {len(parsed_ppia)} PPIA event(s). Edit any cell below before committing.")
+        st.subheader("PPIA Events — Editable Preview")
+        edited_ppia_df = st.data_editor(
+            pd.DataFrame(parsed_ppia),
+            use_container_width=True,
+            hide_index=True,
+            num_rows="dynamic",
+            key="sn_ppia_editor",
+            column_config={
+                "status": st.column_config.SelectboxColumn(options=sorted(PPIA_STATUSES)),
+            },
+        )
+
+    if parsed_alerts and (parsed_records or parsed_ppia):
+        with st.expander(f"Validation Alerts ({len(parsed_alerts)})", expanded=False):
+            for alert in parsed_alerts:
+                if "DEPENDENCY" in alert or "VALIDATION" in alert:
+                    st.markdown(f'<div class="alert-box alert-error">{alert}</div>', unsafe_allow_html=True)
+                elif "INFO" in alert:
+                    st.success(alert)
+                elif "WARNING" in alert or "ERROR" in alert:
                     st.error(alert)
+                else:
+                    st.write(alert)
+
+    if edited_records_df is not None or edited_ppia_df is not None:
+        st.markdown("---")
+        col_a, col_b = st.columns(2)
+        with col_a:
+            if edited_records_df is not None and st.button(
+                "Commit Records to Registry", type="primary", use_container_width=True
+            ):
+                edited_records = edited_records_df.to_dict("records")
+                success, all_msgs = upsert_registry_batch(edited_records)
+                st.success(f"Committed {success}/{len(edited_records)} record(s) to registry.")
+                if success < len(edited_records):
+                    st.warning("Some records failed validation. Check the alerts above.")
+                del st.session_state["sn_parsed_records"]
+                st.rerun()
+        with col_b:
+            if edited_ppia_df is not None and st.button(
+                "Commit PPIA Events to Log", type="primary", use_container_width=True
+            ):
+                edited_events = edited_ppia_df.to_dict("records")
+                success, all_msgs = insert_ppia_batch(edited_events)
+                st.success(f"Logged {success}/{len(edited_events)} PPIA event(s).")
+                if success < len(edited_events):
+                    st.warning("Some events failed validation. Check the alerts above.")
+                del st.session_state["sn_parsed_ppia"]
+                st.rerun()
 
 # =============================================================================
 # TAB 5: REGISTRY EDITOR (Editable Data Grid)
@@ -914,7 +815,7 @@ with tab5:
 
         # Prepare editable columns configuration
         column_config = {}
-        editable_cols = ['system', 'system_kks', 'component', 'it_status', 'pic_status', 'ht_status', 'pt_status', 'saw_status', 'comments']
+        editable_cols = ['system', 'system_kks', 'component', 'commissioning_stage', 'it_status', 'pic_status', 'ht_status', 'pt_status', 'saw_status', 'comments']
 
         for col in editable_cols:
             if col in filtered_df.columns:
@@ -934,6 +835,11 @@ with tab5:
                         "Scope",
                         disabled=True,
                         help="Auto-detected from KKS code"
+                    )
+                elif col == 'commissioning_stage':
+                    column_config[col] = st.column_config.TextColumn(
+                        "Stage",
+                        help="Commissioning stage, e.g. A, A-1, B-2"
                     )
                 elif col == 'comments':
                     column_config[col] = st.column_config.TextColumn(
@@ -1143,11 +1049,11 @@ with tab5:
 # =============================================================================
 
 with tab6:
-    st.subheader("Commissioning Milestone Timeline")
+    st.subheader("Commissioning Timeline")
     st.markdown("""
-    View the commissioning test timeline for individual systems or equipment.
-    Select a KKS code from the dropdown to see its unique milestone progression.
-    Use multi-select to compare multiple items side-by-side.
+    Select a KKS record to see its full commissioning timeline — each milestone
+    (IT, PIC, HT, PT, SAW) plotted on a single line, positioned by date and
+    color-coded by status.
     """)
 
     df = load_registry_df()
@@ -1155,127 +1061,41 @@ with tab6:
     if df.empty:
         st.info("No data in registry yet. Use the Import or Manual tabs to add records.")
     else:
-        # Build selector options: KKS + System + Component
         df['display_label'] = df.apply(
             lambda r: f"{r.get('system_kks', 'N/A')} | {r.get('system', 'Unknown')} / {r.get('component', 'Unknown')}",
             axis=1
         )
 
-        # Filter options
-        st.markdown("#### Filter by Scope")
-        scope_filter_timeline = st.multiselect(
-            "Scope Type",
-            options=df['scope_type'].unique() if 'scope_type' in df.columns else [],
-            default=[],
-            key="timeline_scope_filter",
-            help="Filter the KKS list by scope type"
-        )
+        filter_col1, filter_col2 = st.columns(2)
+        with filter_col1:
+            scope_filter_timeline = st.multiselect(
+                "Filter by Scope Type",
+                options=df['scope_type'].unique() if 'scope_type' in df.columns else [],
+                default=[],
+                key="timeline_scope_filter",
+            )
+        with filter_col2:
+            stage_options = sorted(
+                {parse_commissioning_stage(s) for s in df.get('commissioning_stage', pd.Series(dtype=str)).unique()
+                 if parse_commissioning_stage(s)},
+                key=commissioning_stage_sort_key
+            )
+            stage_filter_timeline = st.multiselect(
+                "Filter by Commissioning Stage",
+                options=stage_options,
+                default=[],
+                key="timeline_stage_filter",
+            )
 
         filtered_for_timeline = df.copy()
         if scope_filter_timeline and 'scope_type' in filtered_for_timeline.columns:
             filtered_for_timeline = filtered_for_timeline[filtered_for_timeline['scope_type'].isin(scope_filter_timeline)]
-
-        # Single KKS selector
-        st.markdown("---")
-        st.markdown("#### Single Item Timeline")
+        if stage_filter_timeline and 'commissioning_stage' in filtered_for_timeline.columns:
+            filtered_for_timeline = filtered_for_timeline[
+                filtered_for_timeline['commissioning_stage'].apply(parse_commissioning_stage).isin(stage_filter_timeline)
+            ]
 
         single_options = filtered_for_timeline['display_label'].tolist()
-        selected_single = st.selectbox(
-            "Select a KKS to view its timeline:",
-            options=["-- Select --"] + single_options,
-            index=0,
-            key="timeline_single_select"
-        )
-
-        if selected_single != "-- Select --":
-            selected_kks = selected_single.split(" | ")[0]
-            record = filtered_for_timeline[filtered_for_timeline['system_kks'] == selected_kks].iloc[0].to_dict()
-
-            # Render single timeline
-            fig = render_milestone_timeline(record, fig_width=12, fig_height=3.5)
-            st.pyplot(fig)
-            plt.close(fig)
-
-            # Show milestone details table
-            st.markdown("#### Milestone Details")
-            detail_data = []
-            for ms in MILESTONES:
-                status = record.get(ms, "Pending")
-                detail_data.append({
-                    "Milestone": MILESTONE_LABELS.get(ms, ms),
-                    "Status": status,
-                })
-            detail_df = pd.DataFrame(detail_data)
-            st.dataframe(detail_df, use_container_width=True, hide_index=True)
-
-            # Dependency check display
-            dep_issues = validate_milestone_dependencies(record)
-            if dep_issues:
-                st.markdown("---")
-                st.error("Dependency Violations Detected:")
-                for issue in dep_issues:
-                    st.markdown(f"- {issue}")
-            else:
-                st.success("All milestone dependencies satisfied.")
-
-        st.markdown("---")
-        st.markdown("#### Multi-Item Comparison Timeline")
-
-        # Multi-select for comparison
-        selected_multi = st.multiselect(
-            "Select multiple KKS codes to compare:",
-            options=single_options,
-            default=[],
-            key="timeline_multi_select",
-            help="Select 2 or more items to compare their milestone timelines side-by-side"
-        )
-
-        if selected_multi:
-            selected_kks_list = [s.split(" | ")[0] for s in selected_multi]
-            selected_records = []
-            for kks in selected_kks_list:
-                rec = filtered_for_timeline[filtered_for_timeline['system_kks'] == kks]
-                if not rec.empty:
-                    selected_records.append(rec.iloc[0].to_dict())
-
-            if selected_records:
-                fig_multi = render_multi_timeline(
-                    selected_records, 
-                    fig_width=14, 
-                    fig_height_per_record=1.2
-                )
-                st.pyplot(fig_multi)
-                plt.close(fig_multi)
-
-                # Summary table
-                st.markdown("#### Comparison Summary")
-                summary_data = []
-                for rec in selected_records:
-                    row = {
-                        "KKS": rec.get('system_kks', 'N/A'),
-                        "System": rec.get('system', 'Unknown'),
-                        "Component": rec.get('component', 'Unknown'),
-                        "Scope": rec.get('scope_type', 'Unknown'),
-                    }
-                    for ms in MILESTONES:
-                        row[MILESTONE_LABELS.get(ms, ms).split(" (")[0]] = rec.get(ms, "Pending")
-                    summary_data.append(row)
-
-                summary_df = pd.DataFrame(summary_data)
-                st.dataframe(summary_df, use_container_width=True, hide_index=True)
-
-        # =====================================================================
-        # INDIVIDUAL TIMELINE (DATE-BASED, single continuous line)
-        # =====================================================================
-        st.markdown("---")
-        st.subheader("Individual Timeline (Date-Based)")
-        st.markdown("""
-        A single continuous line with each milestone plotted as a colored circle
-        precisely above its own date. **Green** = Pass/Completed, **Red** = Fail,
-        **Yellow** = Ongoing/In Progress, **Gray** = Postponed/Pending.
-        If a date wasn't found in your source file, enter it manually below —
-        it will be saved to the registry so you only need to enter it once.
-        """)
 
         def _parse_date_str(s):
             if not s:
@@ -1285,28 +1105,30 @@ with tab6:
             except Exception:
                 return None
 
-        timeline_mode = st.radio(
-            "Timeline mode",
-            options=["One record — 5 milestones", "One milestone — many records"],
-            key="date_timeline_mode",
-            horizontal=True,
+        dt_selected = st.selectbox(
+            "Select a KKS record:",
+            options=["-- Select --"] + single_options,
+            index=0,
+            key="date_timeline_single_select"
         )
 
-        if timeline_mode == "One record — 5 milestones":
-            dt_selected = st.selectbox(
-                "Select a KKS record:",
-                options=["-- Select --"] + single_options,
-                index=0,
-                key="date_timeline_single_select"
-            )
+        if dt_selected != "-- Select --":
+            dt_kks = dt_selected.split(" | ")[0]
+            dt_record = filtered_for_timeline[filtered_for_timeline['system_kks'] == dt_kks].iloc[0].to_dict()
 
-            if dt_selected != "-- Select --":
-                dt_kks = dt_selected.split(" | ")[0]
-                dt_record = filtered_for_timeline[filtered_for_timeline['system_kks'] == dt_kks].iloc[0].to_dict()
+            stage_display = parse_commissioning_stage(dt_record.get('commissioning_stage', '')) or "Not set"
 
-                st.markdown("##### Fill in missing dates (optional)")
+            # --- Header strip: quick facts about this record ---
+            hcol1, hcol2, hcol3, hcol4 = st.columns(4)
+            hcol1.metric("KKS Code", dt_kks)
+            hcol2.metric("Scope", dt_record.get('scope_type', 'Unknown'))
+            hcol3.metric("Commissioning Stage", stage_display)
+            statuses_now = [dt_record.get(ms, "Pending") for ms in MILESTONES]
+            completed_count = sum(1 for s in statuses_now if s == "Completed")
+            hcol4.metric("Milestones Complete", f"{completed_count}/{len(MILESTONES)}")
+
+            with st.expander("Fill in missing milestone dates (optional)", expanded=False):
                 edited_dates = {}
-                missing_any = False
                 cols = st.columns(len(MILESTONES))
                 for idx, ms in enumerate(MILESTONES):
                     date_field = MILESTONE_DATE_FIELDS[ms]
@@ -1317,11 +1139,9 @@ with tab6:
                             st.caption(f"{short_label}: {existing.strftime('%d %b %Y')}")
                             edited_dates[ms] = existing
                         else:
-                            missing_any = True
-                            picked = st.date_input(short_label, value=None, key=f"dt_{dt_kks}_{ms}")
-                            edited_dates[ms] = picked
+                            edited_dates[ms] = st.date_input(short_label, value=None, key=f"dt_{dt_kks}_{ms}")
 
-                if missing_any and st.button("Save entered dates to registry", key="save_dates_single"):
+                if st.button("Save entered dates to registry", key="save_dates_single"):
                     updated_record = dict(dt_record)
                     any_saved = False
                     for ms in MILESTONES:
@@ -1341,96 +1161,34 @@ with tab6:
                     else:
                         st.info("No new dates entered.")
 
-                points = []
-                for ms in MILESTONES:
-                    date_field = MILESTONE_DATE_FIELDS[ms]
-                    d = edited_dates.get(ms) or _parse_date_str(dt_record.get(date_field))
-                    points.append({
-                        "date": d,
-                        "label": MILESTONE_LABELS.get(ms, ms).split(" (")[0],
-                        "status": dt_record.get(ms, "Pending"),
-                    })
+            points = []
+            for ms in MILESTONES:
+                date_field = MILESTONE_DATE_FIELDS[ms]
+                d = edited_dates.get(ms) or _parse_date_str(dt_record.get(date_field))
+                points.append({
+                    "date": d,
+                    "label": MILESTONE_LABELS.get(ms, ms).split(" (")[0],
+                    "status": dt_record.get(ms, "Pending"),
+                })
 
-                fig_dt = render_date_timeline(
-                    points,
-                    title=f"{dt_kks}  |  {dt_record.get('system', 'Unknown')} / {dt_record.get('component', 'Unknown')}",
-                )
-                st.pyplot(fig_dt)
-                plt.close(fig_dt)
-
-        else:  # One milestone — many records
-            ms_choice_label = st.selectbox(
-                "Select milestone to plot:",
-                options=[MILESTONE_LABELS.get(m, m) for m in MILESTONES],
-                key="date_timeline_ms_choice"
+            stage_suffix = f"  |  Stage {stage_display}" if stage_display != "Not set" else ""
+            fig_dt = render_date_timeline(
+                points,
+                title=f"{dt_kks}  |  {dt_record.get('system', 'Unknown')} / {dt_record.get('component', 'Unknown')}{stage_suffix}",
             )
-            ms_choice = MILESTONES[[MILESTONE_LABELS.get(m, m) for m in MILESTONES].index(ms_choice_label)]
-            date_field = MILESTONE_DATE_FIELDS[ms_choice]
+            st.pyplot(fig_dt)
+            plt.close(fig_dt)
 
-            dt_multi = st.multiselect(
-                "Select records to plot on this milestone's timeline:",
-                options=single_options,
-                default=[],
-                key="date_timeline_multi_select",
-            )
+            dep_issues = validate_milestone_dependencies(dt_record)
+            if dep_issues:
+                st.error("Dependency Violations Detected:")
+                for issue in dep_issues:
+                    st.markdown(f"- {issue}")
+            else:
+                st.success("All milestone dependencies satisfied.")
 
-            if dt_multi:
-                dt_kks_list = [s.split(" | ")[0] for s in dt_multi]
-                dt_records = []
-                for kks in dt_kks_list:
-                    rec = filtered_for_timeline[filtered_for_timeline['system_kks'] == kks]
-                    if not rec.empty:
-                        dt_records.append(rec.iloc[0].to_dict())
-
-                st.markdown("##### Fill in missing dates (optional)")
-                edited_multi_dates = {}
-                missing_any_multi = False
-                for rec in dt_records:
-                    kks = rec.get("system_kks", "N/A")
-                    existing = _parse_date_str(rec.get(date_field))
-                    if existing:
-                        edited_multi_dates[kks] = existing
-                    else:
-                        missing_any_multi = True
-                        picked = st.date_input(f"{kks} — {rec.get('component', '')}", value=None, key=f"dtm_{kks}_{ms_choice}")
-                        edited_multi_dates[kks] = picked
-
-                if missing_any_multi and st.button("Save entered dates to registry", key="save_dates_multi"):
-                    any_saved = False
-                    for rec in dt_records:
-                        kks = rec.get("system_kks", "N/A")
-                        val = edited_multi_dates.get(kks)
-                        if val:
-                            updated_record = dict(rec)
-                            updated_record[date_field] = val.strftime("%Y-%m-%d")
-                            ok, msgs = upsert_registry_row(updated_record)
-                            if ok:
-                                any_saved = True
-                            else:
-                                for m in msgs:
-                                    st.error(m)
-                    if any_saved:
-                        st.success("Dates saved.")
-                        st.rerun()
-                    else:
-                        st.info("No new dates entered.")
-
-                points = []
-                for rec in dt_records:
-                    kks = rec.get("system_kks", "N/A")
-                    d = edited_multi_dates.get(kks)
-                    points.append({
-                        "date": d,
-                        "label": kks,
-                        "status": rec.get(ms_choice, "Pending"),
-                    })
-
-                fig_dt_multi = render_date_timeline(
-                    points,
-                    title=f"{MILESTONE_LABELS.get(ms_choice, ms_choice)} — across selected records",
-                )
-                st.pyplot(fig_dt_multi)
-                plt.close(fig_dt_multi)
+            if dt_record.get("comments"):
+                st.caption(f"Comments: {dt_record.get('comments')}")
 
 # =============================================================================
 # TAB 7: KKS REFERENCE
@@ -1620,3 +1378,116 @@ with tab8:
             st.success(message)
         else:
             st.error(message)
+
+# =============================================================================
+# TAB 9: PPIA LOG (Process Protection and Interlock Actuation)
+# =============================================================================
+
+with tab9:
+    st.subheader("PPIA Log — Process Protection and Interlock Actuation")
+    st.markdown("""
+    A running log of protection/interlock actuation events — reactor trips, interlock
+    actuations, protection system alarms — captured automatically from the **Shift Note
+    Parser** and **Data Import & Sync** tabs, or entered manually below. This is a
+    separate, append-only log from the main commissioning registry.
+    """)
+
+    ppia_df = load_ppia_log_df()
+
+    if ppia_df.empty:
+        st.info("No PPIA events logged yet. They'll appear here automatically once the "
+                 "Shift Note Parser or file import detects one, or add one manually below.")
+    else:
+        # --- Summary metrics ---
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Total Events", len(ppia_df))
+        m2.metric("Confirmed", int((ppia_df['status'] == 'Confirmed').sum()) if 'status' in ppia_df.columns else 0)
+        m3.metric("Under Investigation", int((ppia_df['status'] == 'Under Investigation').sum()) if 'status' in ppia_df.columns else 0)
+        m4.metric("False Alarms", int((ppia_df['status'] == 'False Alarm').sum()) if 'status' in ppia_df.columns else 0)
+
+        st.markdown("---")
+        st.markdown("#### Filter")
+        f1, f2 = st.columns(2)
+        with f1:
+            ppia_status_filter = st.multiselect(
+                "Status",
+                options=sorted(PPIA_STATUSES),
+                default=[],
+                key="ppia_status_filter",
+            )
+        with f2:
+            ppia_search = st.text_input(
+                "Search (system, KKS, or description)",
+                key="ppia_search",
+            )
+
+        filtered_ppia = ppia_df.copy()
+        if ppia_status_filter and 'status' in filtered_ppia.columns:
+            filtered_ppia = filtered_ppia[filtered_ppia['status'].isin(ppia_status_filter)]
+        if ppia_search:
+            search_lower = ppia_search.lower()
+            search_cols = [c for c in ['system', 'system_kks', 'interlock_description', 'trigger_cause'] if c in filtered_ppia.columns]
+            if search_cols:
+                mask = False
+                for c in search_cols:
+                    mask = mask | filtered_ppia[c].astype(str).str.lower().str.contains(search_lower, na=False)
+                filtered_ppia = filtered_ppia[mask]
+
+        st.markdown(f"**Showing {len(filtered_ppia)} of {len(ppia_df)} events**")
+        st.dataframe(filtered_ppia, use_container_width=True, hide_index=True)
+
+    st.markdown("---")
+    st.markdown("#### Log a PPIA Event Manually")
+
+    with st.form("manual_ppia_entry", clear_on_submit=True):
+        pc1, pc2 = st.columns(2)
+        with pc1:
+            ppia_system = st.text_input("System Name", placeholder="e.g., Reactor Protection System")
+            ppia_kks = st.text_input("KKS Code (optional)", placeholder="e.g., 10JAA20")
+            ppia_date = st.date_input("Event Date", value=None)
+            ppia_time = st.text_input("Event Time (optional, HH:MM)", placeholder="14:20")
+        with pc2:
+            ppia_status_input = st.selectbox("Status", options=sorted(PPIA_STATUSES))
+            ppia_description = st.text_area(
+                "What actuated/tripped? *",
+                placeholder="e.g., Reactor trip on low pressurizer level"
+            )
+            ppia_cause = st.text_area("Trigger Cause (if known)", placeholder="e.g., Sensor drift during calibration")
+
+        ppia_comments = st.text_area("Additional Comments")
+
+        ppia_submitted = st.form_submit_button("Log PPIA Event", type="primary", use_container_width=True)
+
+        if ppia_submitted:
+            if not ppia_description.strip():
+                st.error("The 'What actuated/tripped?' field is required.")
+            else:
+                entry = {
+                    "system": ppia_system,
+                    "system_kks": ppia_kks,
+                    "event_date": ppia_date.strftime("%Y-%m-%d") if ppia_date else "",
+                    "event_time": ppia_time,
+                    "interlock_description": ppia_description,
+                    "trigger_cause": ppia_cause,
+                    "status": ppia_status_input,
+                    "comments": ppia_comments,
+                    "source": "Manual Entry",
+                }
+                ok, msgs = insert_ppia_batch([entry])
+                if ok:
+                    st.success("PPIA event logged.")
+                    st.rerun()
+                else:
+                    for m in msgs:
+                        st.error(m)
+
+    st.markdown("---")
+    with st.expander("Admin: Clear PPIA Log"):
+        st.warning("This permanently deletes every PPIA event. This cannot be undone.")
+        if st.button("Clear Entire PPIA Log", type="secondary"):
+            ok, msg = clear_ppia_log()
+            if ok:
+                st.success(msg)
+                st.rerun()
+            else:
+                st.error(msg)
