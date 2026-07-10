@@ -72,10 +72,15 @@ OUTPUT FORMAT:
             "scope_type": "System|Equipment|Building",
             "component": "Component Tag",
             "it_status": "Pending|In Progress|Completed|Failed|N/A",
+            "it_date": "YYYY-MM-DD or empty string if not found",
             "pic_status": "Pending|In Progress|Completed|Failed|N/A",
+            "pic_date": "YYYY-MM-DD or empty string if not found",
             "ht_status": "Pending|In Progress|Completed|Failed|N/A",
+            "ht_date": "YYYY-MM-DD or empty string if not found",
             "pt_status": "Pending|In Progress|Completed|Failed|N/A",
+            "pt_date": "YYYY-MM-DD or empty string if not found",
             "saw_status": "Pending|In Progress|Completed|Failed|N/A",
+            "saw_date": "YYYY-MM-DD or empty string if not found",
             "comments": "Any relevant notes including KKS context"
         }}
     ]
@@ -96,6 +101,7 @@ RULES:
 12. Include any anomalies, KKS code issues, or special notes in "comments".
 13. If scope cannot be determined from KKS, infer from context ("system" vs "equipment" vs "building").
 14. Never invent a Unit code — if the shift note doesn't specify one, use "00" (common/shared) and note the assumption in "comments".
+15. For each milestone's companion "_date" field: extract an actual calendar date ONLY if one is explicitly present near that milestone in the source (a completion date, target date, or logged date). Normalize any date format found (DD/MM/YYYY, "5 July 2026", etc.) to YYYY-MM-DD. NEVER invent, guess, or infer a date — if no explicit date is present for that milestone, output an empty string "".
 """
 
 
@@ -285,13 +291,19 @@ def post_process_kks_record(record: Dict[str, Any]) -> Tuple[Dict[str, Any], Lis
 # MAIN PROCESSING PIPELINE
 # =============================================================================
 
-def process_file_smart(file_bytes: bytes, file_name: str) -> Tuple[int, List[str]]:
+def process_file_smart(file_bytes: bytes, file_name: str, force_reprocess: bool = False) -> Tuple[int, List[str]]:
     """
     Incremental, idempotent file processing pipeline with real Rooppur NPP KKS validation.
 
     Args:
         file_bytes: Raw file bytes
         file_name: Original filename
+        force_reprocess: If True, ignores the processed_chunks cache and
+            re-sends every chunk to the AI, re-marking them done afterward.
+            Use this when the registry was cleared/reset but the same file
+            is being re-uploaded — otherwise check_chunk_exists() will still
+            report every chunk as already-processed and skip all of them,
+            silently producing 0 new records.
 
     Returns:
         (records_processed, list of all alert messages)
@@ -315,7 +327,7 @@ def process_file_smart(file_bytes: bytes, file_name: str) -> Tuple[int, List[str
     for i, chunk in enumerate(chunks):
         status_text.text(f"Processing chunk {i+1}/{len(chunks)}...")
 
-        if check_chunk_exists(file_hash, i):
+        if not force_reprocess and check_chunk_exists(file_hash, i):
             st.info(f"Chunk {i+1} already processed (skipping).")
             progress_bar.progress((i + 1) / len(chunks))
             continue
