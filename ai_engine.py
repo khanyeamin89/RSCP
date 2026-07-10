@@ -115,7 +115,18 @@ _last_ai_call_time: float = 0.0
 # Free OpenRouter model used for extraction. ":free" suffix models are the
 # no-cost tier. If OpenRouter retires/renames this model, swap the string
 # here — everything else in this function stays the same.
-_OPENROUTER_MODEL = "meta-llama/llama-3.3-70b-instruct:free"
+# Free OpenRouter models used for extraction, tried in order. ":free" suffix
+# models are the no-cost tier. Rotating across several matters because each
+# free model has its own SHARED capacity pool across all OpenRouter users —
+# a 429 on one model often means that specific model is busy right now, not
+# that your account's daily quota is exhausted. Trying a different model
+# first (before waiting out a backoff) frequently succeeds immediately.
+_OPENROUTER_MODELS = [
+    "meta-llama/llama-3.3-70b-instruct:free",
+    "meta-llama/llama-3.1-8b-instruct:free",
+    "mistralai/mistral-7b-instruct:free",
+    "qwen/qwen-2.5-72b-instruct:free",
+]
 
 
 def _wait_for_rate_limit_slot() -> None:
@@ -130,16 +141,21 @@ def _wait_for_rate_limit_slot() -> None:
 
 def ask_openrouter(prompt: str, max_retries: int = 5) -> Optional[Dict[str, Any]]:
     """
-    OpenRouter API wrapper with JSON enforcement, retry logic, and error handling.
-    Uses a free-tier model, so no per-token cost — subject to OpenRouter's free
-    rate limits (20 requests/minute, 50 requests/day as of mid-2026; higher with
-    a one-time account top-up).
+    OpenRouter API wrapper with JSON enforcement, model rotation, retry logic,
+    and error handling. Uses free-tier models, so no per-token cost — subject
+    to OpenRouter's free rate limits (20 requests/minute, 50 requests/day per
+    account as of mid-2026; higher with a one-time account top-up) AND to
+    each free model's own shared capacity pool across all OpenRouter users.
 
     Rate-limit handling:
     - Paces calls so they're at least _MIN_CALL_INTERVAL_SECONDS apart,
       proactively avoiding many 429s rather than only reacting to them.
-    - On a 429, honors the `Retry-After` response header when present.
-      Falls back to exponential backoff with jitter if the header is missing.
+    - On a 429, tries the NEXT model in _OPENROUTER_MODELS first (a 429 is
+      often that specific model's shared pool being busy, not your account
+      quota — a different free model frequently succeeds immediately).
+    - Only once all models have been tried does it fall back to sleeping:
+      honoring the `Retry-After` response header when present, or
+      exponential backoff with jitter if the header is missing.
     - Defaults to 5 retries since 429s are expected/normal under load on a
       free tier, not exceptional failures.
 
@@ -158,17 +174,6 @@ def ask_openrouter(prompt: str, max_retries: int = 5) -> Optional[Dict[str, Any]
         st.error("OPENROUTER_API_KEY not found in Streamlit secrets.")
         return None
 
-    payload = {
-        "model": _OPENROUTER_MODEL,
-        "messages": [
-            {"role": "system", "content": _build_system_prompt()},
-            {"role": "user", "content": prompt}
-        ],
-        "response_format": {"type": "json_object"},
-        "temperature": 0.1,
-        "max_tokens": 4000
-    }
-
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
@@ -179,7 +184,22 @@ def ask_openrouter(prompt: str, max_retries: int = 5) -> Optional[Dict[str, Any]
     }
 
     response = None
+    model_idx = 0
+    models_tried_this_round = 0
+
     for attempt in range(max_retries + 1):
+        current_model = _OPENROUTER_MODELS[model_idx % len(_OPENROUTER_MODELS)]
+        payload = {
+            "model": current_model,
+            "messages": [
+                {"role": "system", "content": _build_system_prompt()},
+                {"role": "user", "content": prompt}
+            ],
+            "response_format": {"type": "json_object"},
+            "temperature": 0.1,
+            "max_tokens": 4000
+        }
+
         _wait_for_rate_limit_slot()
         try:
             response = requests.post(
@@ -197,26 +217,45 @@ def ask_openrouter(prompt: str, max_retries: int = 5) -> Optional[Dict[str, Any]
         except requests.exceptions.HTTPError as e:
             if response is not None and response.status_code == 429:
                 if attempt < max_retries:
-                    retry_after = response.headers.get("Retry-After") or response.headers.get("retry-after")
-                    if retry_after:
-                        try:
-                            wait_time = float(retry_after)
-                        except ValueError:
-                            wait_time = (2 ** attempt) + random.uniform(0, 1)
+                    models_tried_this_round += 1
+                    if models_tried_this_round < len(_OPENROUTER_MODELS):
+                        # Try the next free model immediately — no sleep.
+                        # This is usually a per-model capacity issue, not an
+                        # account-wide quota issue.
+                        model_idx += 1
+                        st.info(
+                            f"'{current_model}' is busy right now (429). "
+                            f"Trying '{_OPENROUTER_MODELS[model_idx % len(_OPENROUTER_MODELS)]}' instead..."
+                        )
+                        continue
                     else:
-                        wait_time = (2 ** attempt) + random.uniform(0, 1)
-                    st.warning(
-                        f"OpenRouter rate limit hit (attempt {attempt + 1}/{max_retries + 1}). "
-                        f"Waiting {wait_time:.1f}s before retrying..."
-                    )
-                    time.sleep(wait_time)
-                    continue
+                        # Every model in the rotation hit a 429 — this is
+                        # more likely the account-wide daily/minute cap, so
+                        # a real wait is warranted.
+                        models_tried_this_round = 0
+                        retry_after = response.headers.get("Retry-After") or response.headers.get("retry-after")
+                        if retry_after:
+                            try:
+                                wait_time = float(retry_after)
+                            except ValueError:
+                                wait_time = (2 ** attempt) + random.uniform(0, 1)
+                        else:
+                            wait_time = (2 ** attempt) + random.uniform(0, 1)
+                        st.warning(
+                            f"All free models rate limited (attempt {attempt + 1}/{max_retries + 1}). "
+                            f"This likely means your account-wide daily/minute cap is hit. "
+                            f"Waiting {wait_time:.1f}s before retrying..."
+                        )
+                        time.sleep(wait_time)
+                        continue
                 else:
                     st.error(
-                        "OpenRouter API HTTP Error (429): rate limit exceeded and retries exhausted. "
-                        "The free tier allows 20 requests/minute and 50 requests/day. Wait a bit "
-                        "before trying again, process fewer chunks at once, or check your usage "
-                        "at https://openrouter.ai/activity."
+                        "OpenRouter API HTTP Error (429): rate limit exceeded and retries exhausted "
+                        "across all fallback models. The free tier allows 20 requests/minute and "
+                        "50 requests/day per account. Check your usage at "
+                        "https://openrouter.ai/activity — if you're near the daily cap, either wait "
+                        "for it to reset or add a one-time $10 credit to unlock the 1,000/day tier "
+                        "(inference on :free models still costs nothing)."
                     )
                     return None
             status = response.status_code if response is not None else "unknown"
