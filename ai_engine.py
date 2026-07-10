@@ -31,13 +31,13 @@ from config import (
 
 
 # =============================================================================
-# GROQ API INTEGRATION
+# AI (OPENROUTER) API INTEGRATION
 # =============================================================================
 
 def _build_system_prompt() -> str:
-    """Builds the Groq system prompt using the real, hard-coded KKS reference
-    tables from config.py so the model is grounded in actual Rooppur codes
-    rather than a guessed scheme."""
+    """Builds the extraction system prompt using the real, hard-coded KKS
+    reference tables from config.py so the model is grounded in actual
+    Rooppur codes rather than a guessed scheme."""
 
     unit_lines = "\n".join(f"  {k} = {v}" for k, v in UNIT_CODES.items())
     fkey_lines = ", ".join(f"{k}={v}" for k, v in FUNCTION_KEY_LEGEND.items())
@@ -105,9 +105,43 @@ RULES:
 """
 
 
-def ask_groq(prompt: str, max_retries: int = 2) -> Optional[Dict[str, Any]]:
+# Minimum spacing (seconds) enforced between consecutive OpenRouter calls, to
+# avoid tripping the free-tier's 20 requests/minute limit in the first place
+# rather than just reacting to 429s after the fact. Module-level so it
+# persists across Streamlit reruns within the same server process.
+_MIN_CALL_INTERVAL_SECONDS = 3.5
+_last_ai_call_time: float = 0.0
+
+# Free OpenRouter model used for extraction. ":free" suffix models are the
+# no-cost tier. If OpenRouter retires/renames this model, swap the string
+# here — everything else in this function stays the same.
+_OPENROUTER_MODEL = "meta-llama/llama-3.3-70b-instruct:free"
+
+
+def _wait_for_rate_limit_slot() -> None:
+    """Sleeps just long enough to keep consecutive AI calls spaced apart."""
+    global _last_ai_call_time
+    now = time.monotonic()
+    elapsed = now - _last_ai_call_time
+    if elapsed < _MIN_CALL_INTERVAL_SECONDS:
+        time.sleep(_MIN_CALL_INTERVAL_SECONDS - elapsed)
+    _last_ai_call_time = time.monotonic()
+
+
+def ask_openrouter(prompt: str, max_retries: int = 5) -> Optional[Dict[str, Any]]:
     """
-    Groq API wrapper with JSON enforcement, retry logic, and error handling.
+    OpenRouter API wrapper with JSON enforcement, retry logic, and error handling.
+    Uses a free-tier model, so no per-token cost — subject to OpenRouter's free
+    rate limits (20 requests/minute, 50 requests/day as of mid-2026; higher with
+    a one-time account top-up).
+
+    Rate-limit handling:
+    - Paces calls so they're at least _MIN_CALL_INTERVAL_SECONDS apart,
+      proactively avoiding many 429s rather than only reacting to them.
+    - On a 429, honors the `Retry-After` response header when present.
+      Falls back to exponential backoff with jitter if the header is missing.
+    - Defaults to 5 retries since 429s are expected/normal under load on a
+      free tier, not exceptional failures.
 
     Args:
         prompt: The text to send to the LLM
@@ -117,14 +151,15 @@ def ask_groq(prompt: str, max_retries: int = 2) -> Optional[Dict[str, Any]]:
         Parsed JSON dict or None on failure
     """
     import requests
+    import random
 
-    api_key = st.secrets.get("GROQ_API_KEY")
+    api_key = st.secrets.get("OPENROUTER_API_KEY")
     if not api_key:
-        st.error("GROQ_API_KEY not found in Streamlit secrets.")
+        st.error("OPENROUTER_API_KEY not found in Streamlit secrets.")
         return None
 
     payload = {
-        "model": "llama-3.3-70b-versatile",
+        "model": _OPENROUTER_MODEL,
         "messages": [
             {"role": "system", "content": _build_system_prompt()},
             {"role": "user", "content": prompt}
@@ -136,14 +171,19 @@ def ask_groq(prompt: str, max_retries: int = 2) -> Optional[Dict[str, Any]]:
 
     headers = {
         "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
+        # Optional but recommended by OpenRouter for attribution/analytics —
+        # harmless to include, doesn't affect functionality if inaccurate.
+        "HTTP-Referer": "https://rooppur-commissioning-dashboard.local",
+        "X-Title": "Rooppur NPP Reactor Shop Commissioning Dashboard",
     }
 
     response = None
     for attempt in range(max_retries + 1):
+        _wait_for_rate_limit_slot()
         try:
             response = requests.post(
-                "https://api.groq.com/openai/v1/chat/completions",
+                "https://openrouter.ai/api/v1/chat/completions",
                 json=payload,
                 headers=headers,
                 timeout=60
@@ -155,24 +195,43 @@ def ask_groq(prompt: str, max_retries: int = 2) -> Optional[Dict[str, Any]]:
             return json.loads(content)
 
         except requests.exceptions.HTTPError as e:
-            if response is not None and response.status_code == 429 and attempt < max_retries:
-                wait_time = 2 ** attempt
-                st.warning(f"Rate limited. Retrying in {wait_time}s...")
-                time.sleep(wait_time)
-                continue
+            if response is not None and response.status_code == 429:
+                if attempt < max_retries:
+                    retry_after = response.headers.get("Retry-After") or response.headers.get("retry-after")
+                    if retry_after:
+                        try:
+                            wait_time = float(retry_after)
+                        except ValueError:
+                            wait_time = (2 ** attempt) + random.uniform(0, 1)
+                    else:
+                        wait_time = (2 ** attempt) + random.uniform(0, 1)
+                    st.warning(
+                        f"OpenRouter rate limit hit (attempt {attempt + 1}/{max_retries + 1}). "
+                        f"Waiting {wait_time:.1f}s before retrying..."
+                    )
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    st.error(
+                        "OpenRouter API HTTP Error (429): rate limit exceeded and retries exhausted. "
+                        "The free tier allows 20 requests/minute and 50 requests/day. Wait a bit "
+                        "before trying again, process fewer chunks at once, or check your usage "
+                        "at https://openrouter.ai/activity."
+                    )
+                    return None
             status = response.status_code if response is not None else "unknown"
-            st.error(f"Groq API HTTP Error ({status}): {str(e)}")
+            st.error(f"OpenRouter API HTTP Error ({status}): {str(e)}")
             return None
         except json.JSONDecodeError as e:
-            st.error(f"Groq returned invalid JSON: {str(e)}")
+            st.error(f"OpenRouter returned invalid JSON: {str(e)}")
             return None
         except requests.exceptions.RequestException as e:
             if attempt < max_retries:
-                wait_time = 2 ** attempt
-                st.warning(f"Request failed ({str(e)}). Retrying in {wait_time}s...")
+                wait_time = (2 ** attempt) + random.uniform(0, 1)
+                st.warning(f"Request failed ({str(e)}). Retrying in {wait_time:.1f}s...")
                 time.sleep(wait_time)
                 continue
-            st.error(f"Groq API call failed: {str(e)}")
+            st.error(f"OpenRouter API call failed: {str(e)}")
             return None
 
     return None
@@ -332,7 +391,7 @@ def process_file_smart(file_bytes: bytes, file_name: str, force_reprocess: bool 
             progress_bar.progress((i + 1) / len(chunks))
             continue
 
-        data = ask_groq(chunk)
+        data = ask_openrouter(chunk)
         if data is None:
             all_alerts.append(f"ERROR: Failed to process chunk {i+1}")
             progress_bar.progress((i + 1) / len(chunks))
@@ -380,7 +439,7 @@ def parse_shift_notes(notes_text: str) -> Tuple[List[Dict[str, Any]], List[str]]
     if not notes_text or not notes_text.strip():
         return [], ["ERROR: Empty shift notes provided"]
 
-    data = ask_groq(notes_text)
+    data = ask_openrouter(notes_text)
     if data is None:
         return [], ["ERROR: AI extraction failed"]
 
