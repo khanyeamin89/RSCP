@@ -59,6 +59,8 @@ from database import (
     load_ppia_log_df,
     insert_ppia_batch,
     clear_ppia_log,
+    load_milestone_history_for,
+    clear_milestone_history,
 )
 from ai_engine import process_file_smart, parse_shift_notes
 
@@ -1184,15 +1186,35 @@ with tab6:
                     else:
                         st.info("No new dates entered.")
 
+            history_events = load_milestone_history_for(dt_kks, dt_record.get('component', ''))
+
             points = []
-            for ms in MILESTONES:
-                date_field = MILESTONE_DATE_FIELDS[ms]
-                d = edited_dates.get(ms) or _parse_date_str(dt_record.get(date_field))
-                points.append({
-                    "date": d,
-                    "label": MILESTONE_LABELS.get(ms, ms).split(" (")[0],
-                    "status": dt_record.get(ms, "Pending"),
-                })
+            if history_events:
+                for ev in history_events:
+                    d = _parse_date_str(ev.get("event_date"))
+                    if d:
+                        points.append({
+                            "date": d,
+                            "label": MILESTONE_LABELS.get(ev.get("milestone", ""), ev.get("milestone", "")).split(" (")[0],
+                            "status": ev.get("status", "Pending"),
+                        })
+                st.caption(
+                    f"Showing all {len(history_events)} recorded test attempt(s) for this record — "
+                    f"every retest is preserved, not just the latest."
+                )
+            else:
+                # No history logged yet for this record (e.g. it predates this
+                # feature, or was bulk-imported before any change occurred) —
+                # fall back to showing the current single snapshot per milestone.
+                for ms in MILESTONES:
+                    date_field = MILESTONE_DATE_FIELDS[ms]
+                    d = edited_dates.get(ms) or _parse_date_str(dt_record.get(date_field))
+                    points.append({
+                        "date": d,
+                        "label": MILESTONE_LABELS.get(ms, ms).split(" (")[0],
+                        "status": dt_record.get(ms, "Pending"),
+                    })
+                st.caption("No retest history logged yet for this record — showing the current status of each milestone.")
 
             stage_suffix = f"  |  Stage {stage_display}" if stage_display != "Not set" else ""
             fig_dt = render_date_timeline(
@@ -1201,6 +1223,14 @@ with tab6:
             )
             st.pyplot(fig_dt)
             plt.close(fig_dt)
+
+            if history_events:
+                with st.expander("Full test history (table)", expanded=False):
+                    hist_df = pd.DataFrame(history_events)
+                    display_cols = [c for c in ["event_date", "milestone", "status", "comments", "source"] if c in hist_df.columns]
+                    hist_df = hist_df[display_cols].sort_values("event_date")
+                    hist_df["milestone"] = hist_df["milestone"].apply(lambda m: MILESTONE_LABELS.get(m, m).split(" (")[0])
+                    st.dataframe(hist_df, width="stretch", hide_index=True)
 
             dep_issues = validate_milestone_dependencies(dt_record)
             if dep_issues:
@@ -1397,6 +1427,22 @@ with tab8:
     if st.button("Clear Chunk Cache (all files)", width="stretch"):
         with st.spinner("Clearing chunk cache..."):
             success, message = clear_processed_chunks()
+        if success:
+            st.success(message)
+        else:
+            st.error(message)
+
+    st.markdown("---")
+    st.markdown("#### Clear Milestone Test History")
+    st.warning("""
+    This permanently deletes every logged test attempt (every retest, every past
+    pass/fail) across all records — not just the current status shown in the registry.
+    This cannot be undone. Only use this if you're intentionally resetting the
+    commissioning history, not for routine cleanup.
+    """)
+    if st.button("Clear Entire Milestone Test History", type="secondary"):
+        with st.spinner("Clearing milestone test history..."):
+            success, message = clear_milestone_history()
         if success:
             st.success(message)
         else:
