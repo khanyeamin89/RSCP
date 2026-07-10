@@ -22,6 +22,8 @@ from config import (
     MILESTONES,
     MILESTONE_LABELS,
     ScopeType,
+    PPIA_LOG_SCHEMA,
+    validate_ppia_entry,
 )
 
 
@@ -261,3 +263,123 @@ def upsert_registry_batch(records: List[Dict[str, Any]]) -> Tuple[int, List[str]
 
     progress.empty()
     return success_count, all_messages
+
+
+# =============================================================================
+# PPIA LOG (Process Protection and Interlock Actuation)
+# =============================================================================
+# An append-only event log — separate table from `registry`, no unique-key
+# upsert. Each protection/interlock actuation reported gets its own row.
+
+def load_ppia_log() -> List[Dict[str, Any]]:
+    """Loads all records from the ppia_log table, most recent first."""
+    try:
+        supabase = get_supabase_client()
+        response = (
+            supabase.table("ppia_log")
+            .select("*")
+            .order("event_date", desc=True)
+            .execute()
+        )
+        return response.data if response.data else []
+    except APIError as e:
+        st.error(f"Database Error loading PPIA log: {e.message}")
+        return []
+    except Exception as e:
+        st.error(f"Unexpected error loading PPIA log: {str(e)}")
+        return []
+
+
+def load_ppia_log_df() -> "pd.DataFrame":
+    """Loads the PPIA log as a pandas DataFrame."""
+    import pandas as pd
+    data = load_ppia_log()
+    if not data:
+        return pd.DataFrame(columns=list(PPIA_LOG_SCHEMA.keys()))
+    return pd.DataFrame(data)
+
+
+def insert_ppia_entry(entry: Dict[str, Any], skip_validation: bool = False) -> Tuple[bool, List[str]]:
+    """
+    Inserts a single PPIA log entry. Always inserts a new row (append-only —
+    no unique-key upsert, since the same interlock can legitimately actuate
+    more than once).
+
+    Returns:
+        (success: bool, messages: list of info/warning/error strings)
+    """
+    messages: List[str] = []
+
+    if not skip_validation:
+        is_valid, issues = validate_ppia_entry(entry)
+        if not is_valid:
+            for issue in issues:
+                messages.append(f"VALIDATION ERROR: {issue}")
+            return False, messages
+        for issue in issues:
+            if issue.startswith("KKS Note:"):
+                messages.append(issue)
+
+    clean_entry = {}
+    for field, field_type in PPIA_LOG_SCHEMA.items():
+        val = entry.get(field)
+        if val is None:
+            clean_entry[field] = "" if field_type == str else None
+        else:
+            clean_entry[field] = str(val) if field_type == str else val
+
+    try:
+        supabase = get_supabase_client()
+        supabase.table("ppia_log").insert(clean_entry).execute()
+        messages.append(
+            f"SUCCESS: PPIA event logged for '{entry.get('system_kks') or entry.get('system', 'Unknown')}'"
+        )
+        return True, messages
+    except APIError as e:
+        err_msg = f"Database insert failed: {e.message}"
+        messages.append(f"ERROR: {err_msg}")
+        st.error(err_msg)
+        return False, messages
+    except Exception as e:
+        err_msg = f"Unexpected error during PPIA insert: {str(e)}"
+        messages.append(f"ERROR: {err_msg}")
+        st.error(err_msg)
+        return False, messages
+
+
+def insert_ppia_batch(entries: List[Dict[str, Any]]) -> Tuple[int, List[str]]:
+    """Batch insert of PPIA log entries. Returns (success_count, all_messages)."""
+    success_count = 0
+    all_messages: List[str] = []
+
+    if not entries:
+        return 0, ["INFO: No PPIA events to log."]
+
+    for entry in entries:
+        ok, msgs = insert_ppia_entry(entry)
+        all_messages.extend(msgs)
+        if ok:
+            success_count += 1
+
+    return success_count, all_messages
+
+
+def clear_ppia_log() -> Tuple[bool, str]:
+    """
+    Clears ALL records from the ppia_log table. Use with extreme caution —
+    this is irreversible.
+
+    Returns:
+        (success: bool, message: str)
+    """
+    try:
+        supabase = get_supabase_client()
+        # Same "match everything" pattern as clear_registry(): PostgREST
+        # requires a delete filter, and every row has a non-empty
+        # interlock_description, so neq() against it matches (and removes) all.
+        supabase.table("ppia_log").delete().neq("interlock_description", "").execute()
+        return True, "PPIA log cleared successfully. All events removed."
+    except APIError as e:
+        return False, f"Database error clearing PPIA log: {e.message}"
+    except Exception as e:
+        return False, f"Unexpected error clearing PPIA log: {str(e)}"
