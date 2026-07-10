@@ -199,6 +199,41 @@ def mark_chunk_done(file_hash: str, chunk_index: int) -> bool:
         return False
 
 
+def clear_processed_chunks(file_hash: Optional[str] = None) -> Tuple[bool, str]:
+    """
+    Clears chunk-tracking records so files can be re-imported from scratch.
+
+    This is the missing piece behind "I cleared the registry but re-uploading
+    the same file processes 0 records": clear_registry() only empties the
+    `registry` table, not `processed_chunks`, so check_chunk_exists() keeps
+    reporting every chunk of that file as already-done and skips it.
+
+    Args:
+        file_hash: If given, only clears chunks for that specific file
+                   (its MD5 — the same value process_file_smart computes
+                   internally via hashlib.md5(file_bytes).hexdigest()).
+                   If None, clears the ENTIRE processed_chunks table.
+
+    Returns:
+        (success: bool, message: str)
+    """
+    try:
+        supabase = get_supabase_client()
+        if file_hash:
+            supabase.table("processed_chunks").delete().eq("file_hash", file_hash).execute()
+            return True, f"Cleared chunk cache for file hash '{file_hash}'. It can now be re-imported."
+        else:
+            # Same "match everything" trick as clear_registry(): PostgREST
+            # requires a delete filter, and every row has a non-empty
+            # file_hash, so neq("file_hash", "") matches (and removes) all.
+            supabase.table("processed_chunks").delete().neq("file_hash", "").execute()
+            return True, "Chunk cache cleared entirely. All previously-uploaded files can now be re-imported."
+    except APIError as e:
+        return False, f"Database error clearing chunk cache: {e.message}"
+    except Exception as e:
+        return False, f"Unexpected error clearing chunk cache: {str(e)}"
+
+
 # =============================================================================
 # BATCH OPERATIONS
 # =============================================================================
