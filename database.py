@@ -21,9 +21,12 @@ from config import (
     REGISTRY_UNIQUE_KEYS,
     MILESTONES,
     MILESTONE_LABELS,
+    MILESTONE_DATE_FIELDS,
     ScopeType,
     PPIA_LOG_SCHEMA,
     validate_ppia_entry,
+    MILESTONE_HISTORY_SCHEMA,
+    validate_milestone_history_entry,
 )
 
 
@@ -77,6 +80,52 @@ def clear_registry() -> Tuple[bool, str]:
         return False, f"Database error clearing registry: {e.message}"
     except Exception as e:
         return False, f"Unexpected error clearing registry: {str(e)}"
+
+
+def _today_str() -> str:
+    from datetime import date
+    return date.today().isoformat()
+
+
+def _build_history_events(existing_row: Optional[Dict[str, Any]], new_row: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Compares each milestone's (status, date) in the incoming row against what
+    was already stored, and returns one history event per milestone that
+    genuinely changed — a new status, a new date, or both. "Pending"/"N/A"/
+    empty statuses are skipped since they aren't a completed test attempt,
+    just the absence of one.
+
+    If a status changed but no date was supplied, today's date is used as a
+    fallback so the change is still placed correctly on the timeline (better
+    than silently dropping it).
+    """
+    events: List[Dict[str, Any]] = []
+    old = existing_row or {}
+
+    for ms in MILESTONES:
+        new_status = new_row.get(ms, "")
+        if not new_status or new_status in ("Pending", "N/A", "Not Applicable"):
+            continue
+
+        old_status = old.get(ms, "")
+        date_field = MILESTONE_DATE_FIELDS[ms]
+        new_date = new_row.get(date_field, "") or ""
+        old_date = old.get(date_field, "") or ""
+
+        changed = (new_status != old_status) or (new_date and new_date != old_date)
+        if changed:
+            events.append({
+                "system": new_row.get("system", ""),
+                "system_kks": new_row.get("system_kks", ""),
+                "component": new_row.get("component", ""),
+                "milestone": ms,
+                "status": new_status,
+                "event_date": new_date or _today_str(),
+                "comments": new_row.get("comments", ""),
+                "source": "Registry Update",
+            })
+
+    return events
 
 
 def upsert_registry_row(row: Dict[str, Any], skip_validation: bool = False) -> Tuple[bool, List[str]]:
@@ -138,6 +187,13 @@ def upsert_registry_row(row: Dict[str, Any], skip_validation: bool = False) -> T
         else:
             clean_row[field] = str(val) if field_type == str else val
 
+    # --- Step 4.5: Diff against the existing row (if any) BEFORE overwriting,
+    # so every genuine milestone change gets logged to history. Without this,
+    # a retest simply overwrites the previous status+date and that attempt's
+    # record is lost forever — see MILESTONE_HISTORY_SCHEMA in config.py.
+    existing_row = get_registry_row(clean_row.get("system", ""), clean_row.get("component", ""))
+    history_events = _build_history_events(existing_row, clean_row)
+
     # --- Step 5: Execute upsert ---
     try:
         supabase = get_supabase_client()
@@ -147,6 +203,19 @@ def upsert_registry_row(row: Dict[str, Any], skip_validation: bool = False) -> T
         ).execute()
 
         messages.append(f"SUCCESS: Record upserted for '{row.get('system', 'Unknown')}' / '{row.get('component', 'Unknown')}'")
+
+        # Log any milestone changes to history AFTER the upsert succeeds, so
+        # we never record a history event for a save that didn't actually go through.
+        for event in history_events:
+            ok, hist_msgs = insert_milestone_history_entry(event)
+            if ok:
+                messages.append(
+                    f"HISTORY: Logged {MILESTONE_LABELS.get(event['milestone'], event['milestone'])} "
+                    f"= {event['status']} on {event['event_date'] or 'unknown date'}"
+                )
+            else:
+                messages.extend(hist_msgs)
+
         return True, messages
 
     except APIError as e:
@@ -383,3 +452,115 @@ def clear_ppia_log() -> Tuple[bool, str]:
         return False, f"Database error clearing PPIA log: {e.message}"
     except Exception as e:
         return False, f"Unexpected error clearing PPIA log: {str(e)}"
+
+
+# =============================================================================
+# MILESTONE TEST HISTORY (append-only — every test attempt, not just latest)
+# =============================================================================
+
+def insert_milestone_history_entry(entry: Dict[str, Any], skip_validation: bool = False) -> Tuple[bool, List[str]]:
+    """
+    Inserts a single milestone test-history event. Always inserts a new row
+    (append-only — the whole point is to preserve every attempt, not just
+    the latest one).
+
+    Returns:
+        (success: bool, messages: list of info/warning/error strings)
+    """
+    messages: List[str] = []
+
+    if not skip_validation:
+        is_valid, issues = validate_milestone_history_entry(entry)
+        if not is_valid:
+            for issue in issues:
+                messages.append(f"VALIDATION ERROR: {issue}")
+            return False, messages
+
+    clean_entry = {}
+    for field, field_type in MILESTONE_HISTORY_SCHEMA.items():
+        val = entry.get(field)
+        if val is None:
+            clean_entry[field] = "" if field_type == str else None
+        else:
+            clean_entry[field] = str(val) if field_type == str else val
+
+    try:
+        supabase = get_supabase_client()
+        supabase.table("milestone_history").insert(clean_entry).execute()
+        return True, messages
+    except APIError as e:
+        err_msg = f"Database insert failed: {e.message}"
+        messages.append(f"ERROR: {err_msg}")
+        return False, messages
+    except Exception as e:
+        err_msg = f"Unexpected error during history insert: {str(e)}"
+        messages.append(f"ERROR: {err_msg}")
+        return False, messages
+
+
+def load_milestone_history() -> List[Dict[str, Any]]:
+    """Loads all milestone test-history events, most recent first."""
+    try:
+        supabase = get_supabase_client()
+        response = (
+            supabase.table("milestone_history")
+            .select("*")
+            .order("event_date", desc=True)
+            .execute()
+        )
+        return response.data if response.data else []
+    except APIError as e:
+        st.error(f"Database Error loading milestone history: {e.message}")
+        return []
+    except Exception as e:
+        st.error(f"Unexpected error loading milestone history: {str(e)}")
+        return []
+
+
+def load_milestone_history_df() -> "pd.DataFrame":
+    """Loads the milestone test-history as a pandas DataFrame."""
+    import pandas as pd
+    data = load_milestone_history()
+    if not data:
+        return pd.DataFrame(columns=list(MILESTONE_HISTORY_SCHEMA.keys()))
+    return pd.DataFrame(data)
+
+
+def load_milestone_history_for(system_kks: str, component: str) -> List[Dict[str, Any]]:
+    """Loads every test-history event for one specific system+component,
+    across all 5 milestones — this is what the timeline chart plots."""
+    try:
+        supabase = get_supabase_client()
+        response = (
+            supabase.table("milestone_history")
+            .select("*")
+            .eq("system_kks", system_kks)
+            .eq("component", component)
+            .order("event_date", desc=False)
+            .execute()
+        )
+        return response.data if response.data else []
+    except APIError as e:
+        st.error(f"Database Error loading test history: {e.message}")
+        return []
+    except Exception as e:
+        st.error(f"Unexpected error loading test history: {str(e)}")
+        return []
+
+
+def clear_milestone_history() -> Tuple[bool, str]:
+    """
+    Clears ALL records from the milestone_history table. Use with extreme
+    caution — this is irreversible and discards all retest history.
+
+    Returns:
+        (success: bool, message: str)
+    """
+    try:
+        supabase = get_supabase_client()
+        supabase.table("milestone_history").delete().neq("milestone", "").execute()
+        return True, "Milestone test history cleared successfully. All events removed."
+    except APIError as e:
+        return False, f"Database error clearing milestone history: {e.message}"
+    except Exception as e:
+        return False, f"Unexpected error clearing milestone history: {str(e)}"
