@@ -21,7 +21,7 @@ postgrest>=0.16.0
 # DATA PROCESSING - Pandas (DataFrames, analytics)
 # ------------------------------------------------------------------------------
 pandas>=2.0.0
-numpy>=1.24.0
+numpy
 
 # ------------------------------------------------------------------------------
 # AI ENGINE - Groq API integration
