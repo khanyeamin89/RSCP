@@ -1071,6 +1071,47 @@ def validate_ppia_entry(entry: Dict[str, Any]) -> Tuple[bool, List[str]]:
     return (len([i for i in issues if not i.startswith("KKS Note:")]) == 0), issues
 
 # =============================================================================
+# MILESTONE TEST HISTORY (append-only, every test attempt — not just latest)
+# =============================================================================
+# The `registry` table holds one row per (system, component) — it can only
+# ever show the CURRENT/latest status+date for each milestone. If a pump
+# fails IT on 01.01.2026, passes a retest on 10.01.2026, then gets a repeat
+# verification on 10.12.2026, the registry only ever shows the most recent
+# of those. This table keeps every attempt, so the full history is never
+# lost and can be plotted on the timeline.
+
+MILESTONE_HISTORY_SCHEMA: Dict[str, type] = {
+    "system": str,
+    "system_kks": str,
+    "component": str,
+    "milestone": str,     # one of MILESTONES, e.g. "it_status"
+    "status": str,        # the status AT THAT TEST, e.g. "Failed", "Completed"
+    "event_date": str,    # YYYY-MM-DD — when that specific test/attempt happened
+    "comments": str,
+    "source": str,        # e.g. filename, "Shift Note Parser", "Manual Entry"
+}
+
+MILESTONE_HISTORY_REQUIRED_FIELDS: Set[str] = {"system_kks", "component", "milestone"}
+
+
+def validate_milestone_history_entry(entry: Dict[str, Any]) -> Tuple[bool, List[str]]:
+    """Lightweight validation for a single test-history entry."""
+    issues: List[str] = []
+    for field_name in MILESTONE_HISTORY_REQUIRED_FIELDS:
+        if not entry.get(field_name):
+            issues.append(f"Missing required field: '{field_name}'")
+
+    milestone = entry.get("milestone", "")
+    if milestone and milestone not in MILESTONES:
+        issues.append(f"Invalid milestone '{milestone}'. Must be one of: {', '.join(MILESTONES)}")
+
+    status = entry.get("status", "")
+    if status and status not in VALID_STATUSES:
+        issues.append(f"Invalid status '{status}'. Must be one of: {', '.join(sorted(VALID_STATUSES))}")
+
+    return len(issues) == 0, issues
+
+# =============================================================================
 # SUPABASE CLIENT (Single Source of Truth)
 # =============================================================================
 
