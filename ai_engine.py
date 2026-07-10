@@ -31,7 +31,7 @@ from config import (
 
 
 # =============================================================================
-# AI (OPENROUTER) API INTEGRATION
+# AI (MISTRAL) API INTEGRATION
 # =============================================================================
 
 def _build_system_prompt() -> str:
@@ -105,22 +105,19 @@ RULES:
 """
 
 
-# Minimum spacing (seconds) enforced between consecutive OpenRouter calls, to
-# avoid tripping the free-tier's 20 requests/minute limit in the first place
-# rather than just reacting to 429s after the fact. Module-level so it
-# persists across Streamlit reruns within the same server process.
+# Minimum spacing (seconds) enforced between consecutive Mistral calls. Their
+# free "Experiment" tier is rate-limited (roughly 1 request/second-ish,
+# providers don't always publish exact figures), so this stays comfortably
+# above that. Module-level so it persists across Streamlit reruns within the
+# same server process.
 _MIN_CALL_INTERVAL_SECONDS = 3.5
+
 _last_ai_call_time: float = 0.0
 
-# Free OpenRouter model used for extraction. ":free" suffix models are the
-# no-cost tier. If OpenRouter retires/renames this model, swap the string
-# here — everything else in this function stays the same.
-# OpenRouter's built-in Free Models Router. Instead of hardcoding specific
-# ":free" model slugs (which go stale — deprecated models 404, and OpenRouter
-# confirms failed/404 attempts still count against your daily quota), this
-# lets OpenRouter itself pick from whatever free models are actually live
-# right now and handles model-level fallback on their end.
-_OPENROUTER_MODEL = "openrouter/free"
+# Mistral Small via the "-latest" alias, which Mistral keeps pointed at their
+# current small model rather than a specific dated snapshot — this avoids the
+# stale-model-slug 404s hit with OpenRouter's hardcoded model names.
+_MISTRAL_MODEL = "mistral-small-latest"
 
 
 def _wait_for_rate_limit_slot() -> None:
@@ -133,25 +130,20 @@ def _wait_for_rate_limit_slot() -> None:
     _last_ai_call_time = time.monotonic()
 
 
-def ask_openrouter(prompt: str, max_retries: int = 5) -> Optional[Dict[str, Any]]:
+def ask_mistral(prompt: str, max_retries: int = 5) -> Optional[Dict[str, Any]]:
     """
-    OpenRouter API wrapper with JSON enforcement, model rotation, retry logic,
-    and error handling. Uses OpenRouter's Free Models Router ("openrouter/free"),
-    which picks from whatever free models are actually live right now and
-    handles model-level fallback on OpenRouter's end — no per-token cost,
-    subject to OpenRouter's account-wide free rate limits (20 requests/minute,
-    50 requests/day as of mid-2026; higher with a one-time account top-up).
+    Mistral La Plateforme API wrapper with JSON enforcement, retry logic, and
+    error handling. Uses the free "Experiment" tier (~1B tokens/month, no
+    credit card required) via the OpenAI-compatible /v1/chat/completions
+    endpoint.
 
     Rate-limit handling:
     - Paces calls so they're at least _MIN_CALL_INTERVAL_SECONDS apart,
       proactively avoiding many 429s rather than only reacting to them.
     - On a 429, honors the `Retry-After` response header when present.
       Falls back to exponential backoff with jitter if the header is missing.
-    - Defaults to 5 retries since 429s are expected/normal under load on a
-      free tier, not exceptional failures.
-    - On a 404 (a requested model slug no longer exists), fails fast with a
-      clear message instead of retrying, since retrying the same bad slug
-      won't help.
+    - Defaults to 5 retries since 429s can happen under load on a free tier,
+      not exceptional failures.
 
     Args:
         prompt: The text to send to the LLM
@@ -163,13 +155,13 @@ def ask_openrouter(prompt: str, max_retries: int = 5) -> Optional[Dict[str, Any]
     import requests
     import random
 
-    api_key = st.secrets.get("OPENROUTER_API_KEY")
+    api_key = st.secrets.get("MISTRAL_API_KEY")
     if not api_key:
-        st.error("OPENROUTER_API_KEY not found in Streamlit secrets.")
+        st.error("MISTRAL_API_KEY not found in Streamlit secrets.")
         return None
 
     payload = {
-        "model": _OPENROUTER_MODEL,
+        "model": _MISTRAL_MODEL,
         "messages": [
             {"role": "system", "content": _build_system_prompt()},
             {"role": "user", "content": prompt}
@@ -182,10 +174,6 @@ def ask_openrouter(prompt: str, max_retries: int = 5) -> Optional[Dict[str, Any]
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
-        # Optional but recommended by OpenRouter for attribution/analytics —
-        # harmless to include, doesn't affect functionality if inaccurate.
-        "HTTP-Referer": "https://rooppur-commissioning-dashboard.local",
-        "X-Title": "Rooppur NPP Reactor Shop Commissioning Dashboard",
     }
 
     response = None
@@ -193,7 +181,7 @@ def ask_openrouter(prompt: str, max_retries: int = 5) -> Optional[Dict[str, Any]
         _wait_for_rate_limit_slot()
         try:
             response = requests.post(
-                "https://openrouter.ai/api/v1/chat/completions",
+                "https://api.mistral.ai/v1/chat/completions",
                 json=payload,
                 headers=headers,
                 timeout=60
@@ -218,34 +206,42 @@ def ask_openrouter(prompt: str, max_retries: int = 5) -> Optional[Dict[str, Any]
                     else:
                         wait_time = (2 ** attempt) + random.uniform(0, 1)
                     st.warning(
-                        f"OpenRouter rate limit hit (attempt {attempt + 1}/{max_retries + 1}). "
+                        f"Mistral rate limit hit (attempt {attempt + 1}/{max_retries + 1}). "
                         f"Waiting {wait_time:.1f}s before retrying..."
                     )
                     time.sleep(wait_time)
                     continue
                 else:
                     st.error(
-                        "OpenRouter API HTTP Error (429): rate limit exceeded and retries exhausted. "
-                        "The free tier allows 20 requests/minute and 50 requests/day per account. "
-                        "Check your usage at https://openrouter.ai/activity — if you're near the "
-                        "daily cap, either wait for it to reset or add a one-time $10 credit to "
-                        "unlock the 1,000/day tier (inference on free models still costs nothing)."
+                        "Mistral API HTTP Error (429): rate limit exceeded and retries exhausted. "
+                        "The free Experiment tier allows roughly 1B tokens/month with a tight "
+                        "per-request rate cap. Check your usage at https://console.mistral.ai "
+                        "under Limits — wait a bit before trying again, or process fewer chunks "
+                        "at once."
                     )
                     return None
 
             if status == 404:
                 st.error(
-                    "OpenRouter API HTTP Error (404): the requested model is no longer available. "
-                    "OpenRouter's free model catalog changes over time; this shouldn't normally "
-                    "happen with the 'openrouter/free' router, but if it does, check "
-                    "https://openrouter.ai/openrouter/free for the current status."
+                    f"Mistral API HTTP Error (404): model '{_MISTRAL_MODEL}' not found. "
+                    "Mistral's model lineup changes over time; check "
+                    "https://docs.mistral.ai/getting-started/models/ for the current model "
+                    "names and update _MISTRAL_MODEL in ai_engine.py if needed."
                 )
                 return None
 
-            st.error(f"OpenRouter API HTTP Error ({status}): {str(e)}")
+            if status == 401:
+                st.error(
+                    "Mistral API HTTP Error (401): invalid or missing API key. Double-check "
+                    "MISTRAL_API_KEY in Streamlit secrets matches the key from "
+                    "https://console.mistral.ai/api-keys."
+                )
+                return None
+
+            st.error(f"Mistral API HTTP Error ({status}): {str(e)}")
             return None
         except json.JSONDecodeError as e:
-            st.error(f"OpenRouter returned invalid JSON: {str(e)}")
+            st.error(f"Mistral returned invalid JSON: {str(e)}")
             return None
         except requests.exceptions.RequestException as e:
             if attempt < max_retries:
@@ -253,7 +249,7 @@ def ask_openrouter(prompt: str, max_retries: int = 5) -> Optional[Dict[str, Any]
                 st.warning(f"Request failed ({str(e)}). Retrying in {wait_time:.1f}s...")
                 time.sleep(wait_time)
                 continue
-            st.error(f"OpenRouter API call failed: {str(e)}")
+            st.error(f"Mistral API call failed: {str(e)}")
             return None
 
     return None
@@ -413,7 +409,7 @@ def process_file_smart(file_bytes: bytes, file_name: str, force_reprocess: bool 
             progress_bar.progress((i + 1) / len(chunks))
             continue
 
-        data = ask_openrouter(chunk)
+        data = ask_mistral(chunk)
         if data is None:
             all_alerts.append(f"ERROR: Failed to process chunk {i+1}")
             progress_bar.progress((i + 1) / len(chunks))
@@ -461,7 +457,7 @@ def parse_shift_notes(notes_text: str) -> Tuple[List[Dict[str, Any]], List[str]]
     if not notes_text or not notes_text.strip():
         return [], ["ERROR: Empty shift notes provided"]
 
-    data = ask_openrouter(notes_text)
+    data = ask_mistral(notes_text)
     if data is None:
         return [], ["ERROR: AI extraction failed"]
 
