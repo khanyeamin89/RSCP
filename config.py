@@ -949,6 +949,7 @@ REGISTRY_SCHEMA: Dict[str, type] = {
     "system_kks": str,
     "scope_type": str,
     "component": str,
+    "commissioning_stage": str,
     "it_status": str,
     "it_date": str,
     "pic_status": str,
@@ -964,6 +965,110 @@ REGISTRY_SCHEMA: Dict[str, type] = {
 
 REGISTRY_REQUIRED_FIELDS: Set[str] = {"system", "component", "system_kks"}
 REGISTRY_UNIQUE_KEYS: List[str] = ["system", "component"]
+
+# -----------------------------------------------------------------------------
+# Commissioning stage (A, A-1, B, B-1, B-2, ...)
+# -----------------------------------------------------------------------------
+# Rooppur commissioning works are organized into lettered stages, with
+# optional numbered sub-stages (A-1, A-2, B-1, B-2, ...). This is separate
+# from the IT/PIC/HT/PT/SAW milestones — a stage is a broader phase of the
+# commissioning program that a given piece of equipment/system belongs to.
+
+_STAGE_PATTERN = re.compile(r"^([A-Za-z])(?:-(\d+))?$")
+
+
+def parse_commissioning_stage(raw: str) -> Optional[str]:
+    """
+    Normalizes a commissioning stage string (e.g. "a1", "A - 1", "b") into the
+    canonical "A", "A-1", "B-2" form. Returns None if it doesn't look like a
+    valid stage at all, so callers can distinguish "no stage given" from
+    "malformed stage".
+    """
+    if not raw:
+        return None
+    cleaned = str(raw).strip().upper().replace(" ", "")
+    # Tolerate "A-1", "A1", "A_1" as equivalent inputs
+    cleaned = cleaned.replace("_", "-")
+    if "-" not in cleaned and len(cleaned) > 1 and cleaned[1:].isdigit():
+        cleaned = f"{cleaned[0]}-{cleaned[1:]}"
+
+    match = _STAGE_PATTERN.match(cleaned)
+    if not match:
+        return None
+    letter, number = match.groups()
+    return f"{letter}-{int(number)}" if number else letter
+
+
+def commissioning_stage_sort_key(stage: str) -> Tuple[str, int]:
+    """
+    Sort key so stages order meaningfully: A, A-1, A-2, B, B-1, B-2, ... rather
+    than plain alphabetical (which would put "A-1" before "A" as a string).
+    Unparseable/empty stages sort last.
+    """
+    normalized = parse_commissioning_stage(stage)
+    if not normalized:
+        return ("~", 9999)  # sorts after all real letters
+    if "-" in normalized:
+        letter, number = normalized.split("-")
+        return (letter, int(number))
+    return (normalized, 0)
+
+# =============================================================================
+# PPIA LOG (Process Protection and Interlock Actuation)
+# =============================================================================
+# A separate, append-only log of discrete protection/interlock actuation
+# EVENTS — a reactor trip, an interlock actuation, a protection system alarm,
+# etc. — as distinct from the pass/fail commissioning MILESTONES tracked in
+# the main registry above. One shift note can report zero, one, or several
+# PPIA events; each becomes its own log row. There is no unique-key upsert
+# for this table (unlike the registry): every event is a new row.
+# -----------------------------------------------------------------------------
+
+PPIA_LOG_SCHEMA: Dict[str, type] = {
+    "system": str,
+    "system_kks": str,
+    "event_date": str,             # YYYY-MM-DD, "" if unknown
+    "event_time": str,             # HH:MM 24h, "" if unknown
+    "interlock_description": str,  # what actuated/tripped (e.g. "Reactor trip on low pressurizer level")
+    "trigger_cause": str,          # what caused it, if known/stated
+    "status": str,
+    "comments": str,
+    "source": str,                 # e.g. filename or "Manual Entry"
+}
+
+PPIA_LOG_REQUIRED_FIELDS: Set[str] = {"interlock_description"}
+
+PPIA_STATUSES: Set[str] = {
+    "Confirmed", "False Alarm", "Resolved", "Under Investigation", "Pending Review",
+}
+
+PPIA_STATUS_LABELS: Dict[str, str] = {s: s for s in PPIA_STATUSES}
+
+
+def validate_ppia_entry(entry: Dict[str, Any]) -> Tuple[bool, List[str]]:
+    """Lightweight validation for a PPIA log entry — far less strict than the
+    main registry validator since this is a free-form incident log, not a
+    KKS-keyed commissioning record."""
+    issues: List[str] = []
+    for field_name in PPIA_LOG_REQUIRED_FIELDS:
+        if not entry.get(field_name):
+            issues.append(f"Missing required field: '{field_name}'")
+
+    status = entry.get("status", "")
+    if status and status not in PPIA_STATUSES:
+        issues.append(
+            f"Invalid PPIA status '{status}'. Must be one of: {', '.join(sorted(PPIA_STATUSES))}"
+        )
+
+    kks = entry.get("system_kks", "")
+    if kks:
+        result = parse_kks(kks)
+        if not result.valid:
+            # Non-fatal for PPIA — KKS may be partially known or not stated —
+            # surfaced as an issue but doesn't block saving the event.
+            issues.append(f"KKS Note: {result.message}")
+
+    return (len([i for i in issues if not i.startswith("KKS Note:")]) == 0), issues
 
 # =============================================================================
 # SUPABASE CLIENT (Single Source of Truth)
