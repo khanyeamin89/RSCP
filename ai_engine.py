@@ -15,7 +15,7 @@ import pandas as pd
 from io import BytesIO
 from typing import Dict, List, Any, Tuple, Optional
 
-from database import upsert_registry_row, check_chunk_exists, mark_chunk_done
+from database import upsert_registry_row, check_chunk_exists, mark_chunk_done, insert_ppia_entry
 from config import (
     get_kks_scope,
     parse_kks,
@@ -27,6 +27,8 @@ from config import (
     MILESTONES,
     MILESTONE_LABELS,
     VALID_STATUSES,
+    parse_commissioning_stage,
+    validate_ppia_entry,
 )
 
 
@@ -62,6 +64,11 @@ KKS CODING RULES (Rooppur NPP Reactor Shop KKS Code Master List):
 - System code function keys (1st letter of the system code): {fkey_lines}
 - Common equipment type codes (2 letters, precede the 3-digit sequence number): {common_types}
 - Milestones (COMMISSIONING TESTS - apply to ALL scope types): IT=Individual Test, PIC=Post-Install Cleaning, HT=Hydro Test, PT=Pneumatic Test, SAW=Start-up & Adjustment
+- PPIA = Process Protection and Interlock Actuation. This is DIFFERENT from the 5 milestones above:
+  a PPIA entry is a discrete EVENT report (a protection system tripped, an interlock actuated, a
+  protection alarm occurred) — not a pass/fail commissioning test status. Look for language like
+  "interlock actuated", "protection trip", "PPIA", "reactor trip on...", "actuation of...",
+  "protection system alarmed", etc. Extract each such event as its own entry.
 
 OUTPUT FORMAT:
 {{
@@ -71,6 +78,7 @@ OUTPUT FORMAT:
             "system_kks": "Full KKS code including the mandatory 2-digit Unit prefix",
             "scope_type": "System|Equipment|Building",
             "component": "Component Tag",
+            "commissioning_stage": "Stage code if present in source (e.g. A, A-1, B, B-2), else empty string",
             "it_status": "Pending|In Progress|Completed|Failed|N/A",
             "it_date": "YYYY-MM-DD or empty string if not found",
             "pic_status": "Pending|In Progress|Completed|Failed|N/A",
@@ -82,6 +90,18 @@ OUTPUT FORMAT:
             "saw_status": "Pending|In Progress|Completed|Failed|N/A",
             "saw_date": "YYYY-MM-DD or empty string if not found",
             "comments": "Any relevant notes including KKS context"
+        }}
+    ],
+    "ppia_events": [
+        {{
+            "system": "System Name",
+            "system_kks": "KKS code if stated, else empty string",
+            "event_date": "YYYY-MM-DD or empty string if not found",
+            "event_time": "HH:MM 24h or empty string if not found",
+            "interlock_description": "What actuated/tripped, in plain language (REQUIRED)",
+            "trigger_cause": "What caused it, if stated, else empty string",
+            "status": "Confirmed|False Alarm|Resolved|Under Investigation|Pending Review",
+            "comments": "Any additional notes"
         }}
     ]
 }}
@@ -102,6 +122,10 @@ RULES:
 13. If scope cannot be determined from KKS, infer from context ("system" vs "equipment" vs "building").
 14. Never invent a Unit code — if the shift note doesn't specify one, use "00" (common/shared) and note the assumption in "comments".
 15. For each milestone's companion "_date" field: extract an actual calendar date ONLY if one is explicitly present near that milestone in the source (a completion date, target date, or logged date). Normalize any date format found (DD/MM/YYYY, "5 July 2026", etc.) to YYYY-MM-DD. NEVER invent, guess, or infer a date — if no explicit date is present for that milestone, output an empty string "".
+16. "ppia_events" is a SEPARATE list from "records" — a PPIA event is not a milestone status update. If the source mentions no protection/interlock actuations, output an empty list for "ppia_events".
+17. PPIA "status" field: if the shift note doesn't explicitly characterize the event, default to "Pending Review" rather than guessing "Confirmed" or "False Alarm".
+18. "interlock_description" is required for every PPIA event — if you cannot state clearly what actuated/tripped, do not create the entry.
+19. "commissioning_stage": Rooppur commissioning works are organized into lettered stages with optional numbered sub-stages — A, A-1, A-2, B, B-1, B-2, C, etc. Look for a column or label in the source explicitly named "Stage", "Commissioning Stage", "Phase", or similar, or an inline mention like "Stage A-1" / "Phase B-2". Extract it exactly as given (a letter, optionally followed by a dash and a number). If no stage is stated anywhere for a record, output an empty string — NEVER guess or infer a stage from context.
 """
 
 
@@ -383,6 +407,21 @@ def post_process_kks_record(record: Dict[str, Any]) -> Tuple[Dict[str, Any], Lis
         (record, alerts)
     """
     alerts: List[str] = []
+
+    # Normalize commissioning stage first — independent of KKS validity, so
+    # it still gets cleaned up even if the KKS code itself has issues below.
+    raw_stage = record.get("commissioning_stage", "")
+    if raw_stage:
+        normalized_stage = parse_commissioning_stage(raw_stage)
+        if normalized_stage:
+            record["commissioning_stage"] = normalized_stage
+        else:
+            alerts.append(
+                f"STAGE WARNING: Could not parse commissioning stage '{raw_stage}' "
+                f"(expected a letter, optionally with a dash and number, e.g. 'A', 'A-1'). "
+                f"Kept as-is for manual review."
+            )
+
     kks = record.get("system_kks", "")
 
     if not kks:
@@ -401,6 +440,36 @@ def post_process_kks_record(record: Dict[str, Any]) -> Tuple[Dict[str, Any], Lis
         record["scope_type"] = parsed.scope.value
 
     return record, alerts
+
+
+def post_process_ppia_event(event: Dict[str, Any], source: str = "") -> Tuple[Dict[str, Any], List[str]]:
+    """
+    Post-processes an AI-extracted PPIA event: normalizes KKS (if given,
+    non-fatal if absent/invalid — PPIA events don't require a KKS), defaults
+    an unstated status to "Pending Review" rather than trusting a guess, and
+    stamps the source file/note.
+    """
+    alerts: List[str] = []
+    event = dict(event)
+
+    kks = event.get("system_kks", "")
+    if kks:
+        parsed = parse_kks(kks)
+        if parsed.valid:
+            alerts.append(f"PPIA KKS INFO: {parsed.message}")
+        else:
+            alerts.append(f"PPIA KKS NOTE: {parsed.message} (non-blocking for PPIA events)")
+
+    if not event.get("status"):
+        event["status"] = "Pending Review"
+
+    event["source"] = source
+
+    is_valid, issues = validate_ppia_entry(event)
+    if not is_valid:
+        alerts.extend(f"PPIA VALIDATION: {i}" for i in issues if not i.startswith("KKS Note:"))
+
+    return event, alerts
 
 
 # =============================================================================
@@ -457,8 +526,9 @@ def process_file_smart(file_bytes: bytes, file_name: str, force_reprocess: bool 
         records = data.get("records", [])
         if not records and all(k in data for k in ('system', 'system_kks', 'component')):
             records = [data]
+        ppia_events = data.get("ppia_events", [])
 
-        st.info(f"Chunk {i+1}: Extracted {len(records)} record(s).")
+        st.info(f"Chunk {i+1}: Extracted {len(records)} record(s), {len(ppia_events)} PPIA event(s).")
 
         for record in records:
             record, kks_alerts = post_process_kks_record(record)
@@ -471,6 +541,12 @@ def process_file_smart(file_bytes: bytes, file_name: str, force_reprocess: bool 
             all_alerts.extend(msgs)
             if ok:
                 total_processed += 1
+
+        for event in ppia_events:
+            event, ppia_alerts = post_process_ppia_event(event, source=file_name)
+            all_alerts.extend(ppia_alerts)
+            ok, msgs = insert_ppia_entry(event)
+            all_alerts.extend(msgs)
 
         mark_chunk_done(file_hash, i)
         progress_bar.progress((i + 1) / len(chunks))
@@ -485,27 +561,31 @@ def process_file_smart(file_bytes: bytes, file_name: str, force_reprocess: bool 
 # NATURAL LANGUAGE SHIFT NOTE PARSER (Direct API)
 # =============================================================================
 
-def parse_shift_notes(notes_text: str) -> Tuple[List[Dict[str, Any]], List[str]]:
+def parse_shift_notes(notes_text: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[str]]:
     """
     Parses natural language shift notes directly into structured records
-    with real Rooppur NPP KKS validation.
+    with real Rooppur NPP KKS validation, plus any PPIA (Process Protection
+    and Interlock Actuation) events mentioned. Neither is saved here — the
+    caller is expected to let the user review/edit before committing.
 
     Returns:
-        (list of parsed records, list of alerts/warnings)
+        (list of parsed registry records, list of parsed PPIA events, list of alerts/warnings)
     """
     if not notes_text or not notes_text.strip():
-        return [], ["ERROR: Empty shift notes provided"]
+        return [], [], ["ERROR: Empty shift notes provided"]
 
     data = ask_mistral(notes_text)
     if data is None:
-        return [], ["ERROR: AI extraction failed"]
+        return [], [], ["ERROR: AI extraction failed"]
 
     records = data.get("records", [])
     if not records and all(k in data for k in ('system', 'system_kks', 'component')):
         records = [data]
+    ppia_events_raw = data.get("ppia_events", [])
 
     alerts: List[str] = []
     validated_records: List[Dict[str, Any]] = []
+    validated_ppia_events: List[Dict[str, Any]] = []
 
     for record in records:
         kks = record.get('system_kks', '')
@@ -526,4 +606,9 @@ def parse_shift_notes(notes_text: str) -> Tuple[List[Dict[str, Any]], List[str]]
         alerts.extend(dep_issues)
         validated_records.append(record)
 
-    return validated_records, alerts
+    for event in ppia_events_raw:
+        event, ppia_alerts = post_process_ppia_event(event, source="Shift Note Parser")
+        alerts.extend(ppia_alerts)
+        validated_ppia_events.append(event)
+
+    return validated_records, validated_ppia_events, alerts
