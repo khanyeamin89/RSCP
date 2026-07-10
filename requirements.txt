@@ -1,36 +1,37 @@
-streamlit>=1.35.0
-supabase>=2.4.0
-requests>=2.31.0
-pandas>=2.2.0
-altair>=5.3.0
-openpyxl>=3.1.0
-python-docx>=1.1.0
-plotly
 # ------------------------------------------------------------------------------
 # CORE FRAMEWORK - Streamlit (UI + session state + caching)
 # ------------------------------------------------------------------------------
-streamlit>=1.40.0
+streamlit==1.59.1
 
 # ------------------------------------------------------------------------------
 # DATABASE - Supabase (PostgreSQL backend)
 # ------------------------------------------------------------------------------
-supabase>=2.0.0
-postgrest>=0.16.0
+supabase==2.31.0
+postgrest==2.31.0
 
 # ------------------------------------------------------------------------------
-# DATA PROCESSING - Pandas (DataFrames, analytics)
+# DATA PROCESSING - Pandas / NumPy / PyArrow
+# pyarrow is pinned deliberately: Streamlit's own tracker confirms Python 3.14
+# needs pyarrow==22.0.0 (streamlit/streamlit#12892) — anything newer resolved
+# automatically here previously caused a native segfault on startup.
+# pandas is pinned below 3.0 since pandas 3.x is brand new (2026) and hasn't
+# been broadly validated against pyarrow 22 yet.
 # ------------------------------------------------------------------------------
-pandas>=2.0.0
-numpy
+pandas==2.2.3
+numpy==1.26.4
+pyarrow==22.0.0
 
 # ------------------------------------------------------------------------------
-# AI ENGINE - Groq API integration
+# AI ENGINE - Mistral API integration (via requests, no SDK needed)
 # ------------------------------------------------------------------------------
-requests>=2.31.0
+requests==2.32.3
 
 # ------------------------------------------------------------------------------
 # FILE PARSING - Excel support
 # ------------------------------------------------------------------------------
-openpyxl>=3.1.0
+openpyxl==3.1.5
 
-matplotlib
+# ------------------------------------------------------------------------------
+# CHARTS - Matplotlib (timeline / milestone visualizations)
+# ------------------------------------------------------------------------------
+matplotlib==3.9.2
