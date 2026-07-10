@@ -31,6 +31,7 @@ from config import (
     ScopeType,
     MILESTONES,
     MILESTONE_LABELS,
+    MILESTONE_DATE_FIELDS,
     VALID_STATUSES,
     STATUS_LABELS,
     SYSTEM_PREFIXES,
@@ -49,6 +50,7 @@ from database import (
     get_registry_row,
     upsert_registry_batch,
     clear_registry,
+    clear_processed_chunks,
 )
 from ai_engine import process_file_smart, parse_shift_notes
 
@@ -131,6 +133,102 @@ def render_milestone_timeline(record: Dict[str, Any], fig_width: float = 12, fig
     ]
     ax.legend(handles=legend_patches, loc="upper right", fontsize=9, 
               frameon=True, fancybox=True, shadow=True)
+
+    plt.tight_layout()
+    return fig
+
+
+def _status_to_dot_color(status: str) -> str:
+    """
+    Maps a status string to the 4-color scheme requested for the date-based
+    timeline: Green=Pass, Red=Fail, Yellow=Ongoing, Gray=Postponed/Unknown.
+    Accepts both the app's native vocabulary (Completed/Failed/In Progress/
+    Pending/N/A) and the Pass/Fail/Ongoing/Postponed vocabulary so either
+    naming works.
+    """
+    s = str(status).strip().lower()
+    if s in ("completed", "pass", "passed"):
+        return "#22c55e"   # green
+    if s in ("failed", "fail"):
+        return "#ef4444"   # red
+    if s in ("in progress", "ongoing", "started"):
+        return "#eab308"   # yellow
+    return "#94a3b8"        # gray — pending / postponed / n/a / unknown
+
+
+def render_date_timeline(points: List[Dict[str, Any]], title: str = "",
+                          fig_width: float = 14, fig_height: float = 4.5) -> plt.Figure:
+    """
+    Horizontal timeline: a single continuous line with circular markers placed
+    precisely above each point's own date, a short label on/next to each
+    circle, and status color-coding (green=Pass, red=Fail, yellow=Ongoing,
+    gray=Postponed/unknown).
+
+    Args:
+        points: list of {"date": datetime.date, "label": str, "status": str,
+                          "tooltip": str (optional, full description)}
+                Only points with a real date are plotted; caller should filter
+                out/handle missing dates (e.g. via manual entry) beforehand.
+        title: chart title
+    """
+    import matplotlib.dates as mdates
+    from datetime import date as _date
+
+    fig, ax = plt.subplots(figsize=(fig_width, fig_height))
+
+    valid_points = [p for p in points if p.get("date")]
+
+    if not valid_points:
+        ax.text(0.5, 0.5, "No dated milestones to plot yet.\nAdd dates below to see them here.",
+                 ha="center", va="center", fontsize=13, color="#64748b")
+        ax.axis("off")
+        return fig
+
+    valid_points = sorted(valid_points, key=lambda p: p["date"])
+    dates = [p["date"] for p in valid_points]
+
+    # The single continuous horizontal line
+    ax.plot([dates[0], dates[-1]], [0, 0], color="#cbd5e1", linewidth=2.5, zorder=1,
+            solid_capstyle="round")
+
+    # Alternate label offset above/below the line to reduce overlap when
+    # dates are close together
+    for i, p in enumerate(valid_points):
+        color = _status_to_dot_color(p.get("status", ""))
+        d = p["date"]
+
+        ax.scatter([d], [0], s=420, color=color, edgecolor="white", linewidth=2, zorder=3)
+
+        label = p.get("label", "")
+        offset = 0.35 if i % 2 == 0 else -0.35
+        va = "bottom" if offset > 0 else "top"
+        ax.plot([d, d], [0, offset], color="#cbd5e1", linewidth=1, zorder=2, linestyle=":")
+        ax.text(d, offset, label, ha="center", va=va, fontsize=10, fontweight="bold", color="#1e293b")
+        # Date directly on/under the circle
+        ax.text(d, -0.12 if offset > 0 else 0.12, d.strftime("%d %b %Y"),
+                ha="center", va="top" if offset > 0 else "bottom",
+                fontsize=7.5, color="#64748b", rotation=0)
+
+    ax.set_ylim(-1.1, 1.1)
+    ax.set_yticks([])
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%d %b %Y"))
+    fig.autofmt_xdate(rotation=30, ha="right")
+
+    for spine in ["top", "right", "left"]:
+        ax.spines[spine].set_visible(False)
+    ax.spines["bottom"].set_color("#cbd5e1")
+
+    if title:
+        ax.set_title(title, fontsize=13, fontweight="bold", pad=20, color="#0f172a")
+
+    legend_patches = [
+        mpatches.Patch(color="#22c55e", label="Pass / Completed"),
+        mpatches.Patch(color="#ef4444", label="Fail"),
+        mpatches.Patch(color="#eab308", label="Ongoing / In Progress"),
+        mpatches.Patch(color="#94a3b8", label="Postponed / Pending"),
+    ]
+    ax.legend(handles=legend_patches, loc="upper center", bbox_to_anchor=(0.5, -0.28),
+              ncol=4, fontsize=9, frameon=False)
 
     plt.tight_layout()
     return fig
@@ -447,6 +545,15 @@ with tab2:
     )
 
     if uploaded:
+        force_reprocess = st.checkbox(
+            "Force reprocess (ignore chunk cache)",
+            key="force_reprocess_chk",
+            help="Turn this on if you've cleared the registry and are re-uploading a file "
+                 "you've imported before. Normally the app skips chunks it has already sent "
+                 "to the AI (to save tokens) — but that means re-uploading the same file "
+                 "after a registry clear produces 0 records, since the cache still thinks "
+                 "every chunk is done. This bypasses that cache for this run."
+        )
         col1, col2 = st.columns([1, 3])
         with col1:
             process_btn = st.button("Run Token-Efficient Sync", type="primary", use_container_width=True)
@@ -454,7 +561,7 @@ with tab2:
         if process_btn:
             with st.spinner("Processing file with Rooppur NPP KKS validation..."):
                 file_bytes = uploaded.getvalue()
-                records_processed, alerts = process_file_smart(file_bytes, uploaded.name)
+                records_processed, alerts = process_file_smart(file_bytes, uploaded.name, force_reprocess=force_reprocess)
 
             if records_processed > 0:
                 st.success(f"Sync Complete! {records_processed} record(s) processed successfully.")
@@ -1163,6 +1270,174 @@ with tab6:
                 summary_df = pd.DataFrame(summary_data)
                 st.dataframe(summary_df, use_container_width=True, hide_index=True)
 
+        # =====================================================================
+        # INDIVIDUAL TIMELINE (DATE-BASED, single continuous line)
+        # =====================================================================
+        st.markdown("---")
+        st.subheader("Individual Timeline (Date-Based)")
+        st.markdown("""
+        A single continuous line with each milestone plotted as a colored circle
+        precisely above its own date. **Green** = Pass/Completed, **Red** = Fail,
+        **Yellow** = Ongoing/In Progress, **Gray** = Postponed/Pending.
+        If a date wasn't found in your source file, enter it manually below —
+        it will be saved to the registry so you only need to enter it once.
+        """)
+
+        def _parse_date_str(s):
+            if not s:
+                return None
+            try:
+                return pd.to_datetime(s).date()
+            except Exception:
+                return None
+
+        timeline_mode = st.radio(
+            "Timeline mode",
+            options=["One record — 5 milestones", "One milestone — many records"],
+            key="date_timeline_mode",
+            horizontal=True,
+        )
+
+        if timeline_mode == "One record — 5 milestones":
+            dt_selected = st.selectbox(
+                "Select a KKS record:",
+                options=["-- Select --"] + single_options,
+                index=0,
+                key="date_timeline_single_select"
+            )
+
+            if dt_selected != "-- Select --":
+                dt_kks = dt_selected.split(" | ")[0]
+                dt_record = filtered_for_timeline[filtered_for_timeline['system_kks'] == dt_kks].iloc[0].to_dict()
+
+                st.markdown("##### Fill in missing dates (optional)")
+                edited_dates = {}
+                missing_any = False
+                cols = st.columns(len(MILESTONES))
+                for idx, ms in enumerate(MILESTONES):
+                    date_field = MILESTONE_DATE_FIELDS[ms]
+                    existing = _parse_date_str(dt_record.get(date_field))
+                    short_label = MILESTONE_LABELS.get(ms, ms).split(" (")[0]
+                    with cols[idx]:
+                        if existing:
+                            st.caption(f"{short_label}: {existing.strftime('%d %b %Y')}")
+                            edited_dates[ms] = existing
+                        else:
+                            missing_any = True
+                            picked = st.date_input(short_label, value=None, key=f"dt_{dt_kks}_{ms}")
+                            edited_dates[ms] = picked
+
+                if missing_any and st.button("Save entered dates to registry", key="save_dates_single"):
+                    updated_record = dict(dt_record)
+                    any_saved = False
+                    for ms in MILESTONES:
+                        date_field = MILESTONE_DATE_FIELDS[ms]
+                        val = edited_dates.get(ms)
+                        if val:
+                            updated_record[date_field] = val.strftime("%Y-%m-%d")
+                            any_saved = True
+                    if any_saved:
+                        ok, msgs = upsert_registry_row(updated_record)
+                        if ok:
+                            st.success("Dates saved.")
+                            st.rerun()
+                        else:
+                            for m in msgs:
+                                st.error(m)
+                    else:
+                        st.info("No new dates entered.")
+
+                points = []
+                for ms in MILESTONES:
+                    date_field = MILESTONE_DATE_FIELDS[ms]
+                    d = edited_dates.get(ms) or _parse_date_str(dt_record.get(date_field))
+                    points.append({
+                        "date": d,
+                        "label": MILESTONE_LABELS.get(ms, ms).split(" (")[0],
+                        "status": dt_record.get(ms, "Pending"),
+                    })
+
+                fig_dt = render_date_timeline(
+                    points,
+                    title=f"{dt_kks}  |  {dt_record.get('system', 'Unknown')} / {dt_record.get('component', 'Unknown')}",
+                )
+                st.pyplot(fig_dt)
+                plt.close(fig_dt)
+
+        else:  # One milestone — many records
+            ms_choice_label = st.selectbox(
+                "Select milestone to plot:",
+                options=[MILESTONE_LABELS.get(m, m) for m in MILESTONES],
+                key="date_timeline_ms_choice"
+            )
+            ms_choice = MILESTONES[[MILESTONE_LABELS.get(m, m) for m in MILESTONES].index(ms_choice_label)]
+            date_field = MILESTONE_DATE_FIELDS[ms_choice]
+
+            dt_multi = st.multiselect(
+                "Select records to plot on this milestone's timeline:",
+                options=single_options,
+                default=[],
+                key="date_timeline_multi_select",
+            )
+
+            if dt_multi:
+                dt_kks_list = [s.split(" | ")[0] for s in dt_multi]
+                dt_records = []
+                for kks in dt_kks_list:
+                    rec = filtered_for_timeline[filtered_for_timeline['system_kks'] == kks]
+                    if not rec.empty:
+                        dt_records.append(rec.iloc[0].to_dict())
+
+                st.markdown("##### Fill in missing dates (optional)")
+                edited_multi_dates = {}
+                missing_any_multi = False
+                for rec in dt_records:
+                    kks = rec.get("system_kks", "N/A")
+                    existing = _parse_date_str(rec.get(date_field))
+                    if existing:
+                        edited_multi_dates[kks] = existing
+                    else:
+                        missing_any_multi = True
+                        picked = st.date_input(f"{kks} — {rec.get('component', '')}", value=None, key=f"dtm_{kks}_{ms_choice}")
+                        edited_multi_dates[kks] = picked
+
+                if missing_any_multi and st.button("Save entered dates to registry", key="save_dates_multi"):
+                    any_saved = False
+                    for rec in dt_records:
+                        kks = rec.get("system_kks", "N/A")
+                        val = edited_multi_dates.get(kks)
+                        if val:
+                            updated_record = dict(rec)
+                            updated_record[date_field] = val.strftime("%Y-%m-%d")
+                            ok, msgs = upsert_registry_row(updated_record)
+                            if ok:
+                                any_saved = True
+                            else:
+                                for m in msgs:
+                                    st.error(m)
+                    if any_saved:
+                        st.success("Dates saved.")
+                        st.rerun()
+                    else:
+                        st.info("No new dates entered.")
+
+                points = []
+                for rec in dt_records:
+                    kks = rec.get("system_kks", "N/A")
+                    d = edited_multi_dates.get(kks)
+                    points.append({
+                        "date": d,
+                        "label": kks,
+                        "status": rec.get(ms_choice, "Pending"),
+                    })
+
+                fig_dt_multi = render_date_timeline(
+                    points,
+                    title=f"{MILESTONE_LABELS.get(ms_choice, ms_choice)} — across selected records",
+                )
+                st.pyplot(fig_dt_multi)
+                plt.close(fig_dt_multi)
+
 # =============================================================================
 # TAB 7: KKS REFERENCE
 # =============================================================================
@@ -1332,3 +1607,22 @@ with tab8:
             st.info("Type 'DELETE ALL' exactly to enable the clear button.")
     else:
         st.info("Check both confirmation boxes above to proceed.")
+
+    st.markdown("---")
+    st.markdown("#### Clear Import Chunk Cache")
+    st.info("""
+    **Why you need this:** to save AI tokens, the importer remembers (by file hash)
+    which chunks of a file it has already sent to the AI, and skips them on the next
+    upload. Clearing the **registry** does NOT clear this cache — so re-uploading the
+    same file afterward will show "0 records processed" because every chunk still looks
+    already-done. Clear the cache here to make a file re-importable from scratch, or
+    just use the "Force reprocess" checkbox on the Import tab for a one-off re-run.
+    """)
+
+    if st.button("Clear Chunk Cache (all files)", use_container_width=True):
+        with st.spinner("Clearing chunk cache..."):
+            success, message = clear_processed_chunks()
+        if success:
+            st.success(message)
+        else:
+            st.error(message)
