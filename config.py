@@ -93,6 +93,40 @@ UNIT_CODES: Dict[str, str] = {
 
 UNIT_CODE_RE = re.compile(r"^\d{2}(?:-\d{2})?$")
 
+
+def classify_unit(unit_prefix: str) -> str:
+    """
+    Classifies a 2-digit KKS unit prefix into a clean, filterable category:
+    Unit 1, Unit 2, Common/Shared, or Temporary — per the rule in Section 2
+    of RPR-QM-AEB0001 (power units coded from digit 1/2, common-station "0",
+    temporary "9"). Used to distinguish Unit 1 vs Unit 2 data throughout the
+    dashboard (analytics breakdowns, filters) without hardcoding every
+    possible 2-digit sub-train combination.
+    """
+    if not unit_prefix:
+        return "Unknown"
+    first_digit = unit_prefix.strip()[:1]
+    if first_digit == "1":
+        return "Unit 1"
+    if first_digit == "2":
+        return "Unit 2"
+    if first_digit == "0":
+        return "Common/Shared"
+    if first_digit == "9":
+        return "Temporary"
+    return "Unknown"
+
+
+def get_unit_from_kks(kks: str) -> str:
+    """Convenience: parses a KKS code and returns its classify_unit() category
+    directly, or 'Unknown' if the code doesn't parse."""
+    if not kks or not isinstance(kks, str):
+        return "Unknown"
+    result = parse_kks(kks)
+    if not result.valid or not result.unit:
+        return "Unknown"
+    return classify_unit(result.unit)
+
 # -----------------------------------------------------------------------------
 # FUNCTION KEY LEGEND (1st letter of every System code)
 # Only letters actually verified against RPR-QM-AEB0001 B05 within Reactor
@@ -379,7 +413,6 @@ SYSTEM_CODES: Dict[str, Tuple[str, str]] = {
     "KBE": ("Coolant purification system", "K"),
     "KBF": ("Coolant treatment system", "K"),
     "KBH": ("Fuel pool water purification system", "K"),
-    "LCQ": ("Steam Generator Blowdown Water Purification System", "L"),
     "KLA": ("Ventilation system of the 10UJA (20UJA) buildings", "K"),
     "KLB": ("Ventilation system of the 10UJB (20UJB) buildings", "K"),
     "KLC": ("Ventilation system of the 10UKA (20UKA) buildings", "K"),
@@ -415,10 +448,6 @@ SYSTEM_CODES: Dict[str, Tuple[str, str]] = {
     "KUB": ("System for taking samples from equipment", "K"),
     "KUC": ("High-level sampling system for radiation control", "K"),
     "KUD": ("System for taking samples from equipment of building 00UYB", "K"),
-    "PEB": ("Component cooling water piping system for essential loads", "P"),
-    "PEC": ("Pump sets for essential loads", "P"),
-    "PED": ("Ventilation units of essential-load cooling system", "P"),
-    "PGB": ("Component cooling systems for normal operation loads", "P"),
     "KUE": ("System for taking samples from Active Water Treatment plants", "K"),
     "KUJ": ("System of taking air samples for mobile gas-aerosol radiometers", "K"),
     "KUK": ("System of taking air samples for stationary gas-aerosol radiometers", "K"),
@@ -525,9 +554,26 @@ MILESTONE_LABELS: Dict[str, str] = {
     "ht_status": "HT (Hydro Test)",
     "pt_status": "PT (Pneumatic Test)",
     "saw_status": "SAW (Start-up & Adjustment)",
+    "p1_status": "P-1 (Protocol Part 1)",
+    "p2_status": "P-2 (Protocol Part 2)",
+    "p3_status": "P-3 (Protocol Part 3)",
 }
 
-MILESTONES: List[str] = ["it_status", "pic_status", "ht_status", "pt_status", "saw_status"]
+MILESTONES: List[str] = [
+    "it_status", "pic_status", "ht_status", "pt_status", "saw_status",
+    "p1_status", "p2_status", "p3_status",
+]
+
+# P-1/P-2/P-3 track test-protocol document sign-off (e.g. real remarks seen
+# in Rooppur tracking sheets: "Completed (P-3 not signed)", "P-1 is checked
+# and comments given"). They reuse the same MILESTONES machinery as the 5
+# physical tests above (status, date, history log, timeline) rather than a
+# separate system, since sign-off is itself a trackable event with its own
+# date and can be retried/corrected just like a physical test. The shared
+# status vocabulary maps as: Pending=not submitted, In Progress=collected but
+# not yet submitted/signed, Completed=submitted and signed, Failed=rejected/
+# returned for correction.
+PROTOCOL_MILESTONES: List[str] = ["p1_status", "p2_status", "p3_status"]
 
 # Each milestone's companion date field (target/completion date for that test).
 # Dates are plain "YYYY-MM-DD" strings (or "" if unknown) — kept as str in the
@@ -539,6 +585,9 @@ MILESTONE_DATE_FIELDS: Dict[str, str] = {
     "ht_status": "ht_date",
     "pt_status": "pt_date",
     "saw_status": "saw_date",
+    "p1_status": "p1_date",
+    "p2_status": "p2_date",
+    "p3_status": "p3_date",
 }
 
 # Valid status values for any milestone
@@ -579,6 +628,12 @@ REGISTRY_SCHEMA: Dict[str, type] = {
     "pt_date": str,
     "saw_status": str,
     "saw_date": str,
+    "p1_status": str,
+    "p1_date": str,
+    "p2_status": str,
+    "p2_date": str,
+    "p3_status": str,
+    "p3_date": str,
     "comments": str,
 }
 
@@ -589,48 +644,65 @@ REGISTRY_UNIQUE_KEYS: List[str] = ["system", "component"]
 # Commissioning stage (A, A-1, B, B-1, B-2, ...)
 # -----------------------------------------------------------------------------
 # Rooppur commissioning works are organized into lettered stages, with
-# optional numbered sub-stages (A-1, A-2, B-1, B-2, ...). This is separate
-# from the IT/PIC/HT/PT/SAW milestones — a stage is a broader phase of the
+# optional numbered sub-stages (A-1, A-2, B-1, B-2, ...) and — per the real
+# Rooppur tracking sheets (e.g. "Tests before Physical Start-Up") — optional
+# DECIMAL sub-stages too (A-3.1, A-3.2, ...). This is separate from the
+# IT/PIC/HT/PT/SAW/P1/P2/P3 milestones — a stage is a broader phase of the
 # commissioning program that a given piece of equipment/system belongs to.
 
-_STAGE_PATTERN = re.compile(r"^([A-Za-z])(?:-(\d+))?$")
+_STAGE_PATTERN = re.compile(r"^([A-Za-z])(?:-(\d+(?:\.\d+)?))?$")
+
+# The real Rooppur tracking sheets are bilingual RU/EN and use Cyrillic
+# look-alike letters for stage codes (e.g. Cyrillic "А" U+0410, visually
+# identical to Latin "A" U+0041, but a different character). Normalize the
+# common ones so "А-1" from a Russian-language cell parses the same as "A-1".
+_CYRILLIC_TO_LATIN_HOMOGLYPHS = str.maketrans({
+    "А": "A", "В": "B", "С": "C", "Е": "E", "Н": "H",
+    "К": "K", "М": "M", "О": "O", "Р": "P", "Т": "T", "Х": "X",
+})
 
 
 def parse_commissioning_stage(raw: str) -> Optional[str]:
     """
-    Normalizes a commissioning stage string (e.g. "a1", "A - 1", "b") into the
-    canonical "A", "A-1", "B-2" form. Returns None if it doesn't look like a
-    valid stage at all, so callers can distinguish "no stage given" from
+    Normalizes a commissioning stage string (e.g. "a1", "A - 1", "b", "A-3.1",
+    or Cyrillic "А-1" from a bilingual source cell) into the canonical "A",
+    "A-1", "B-2", "A-3.1" form. Returns None if it doesn't look like a valid
+    stage at all, so callers can distinguish "no stage given" from
     "malformed stage".
     """
     if not raw:
         return None
-    cleaned = str(raw).strip().upper().replace(" ", "")
+    cleaned = str(raw).strip().translate(_CYRILLIC_TO_LATIN_HOMOGLYPHS).upper().replace(" ", "")
     # Tolerate "A-1", "A1", "A_1" as equivalent inputs
     cleaned = cleaned.replace("_", "-")
-    if "-" not in cleaned and len(cleaned) > 1 and cleaned[1:].isdigit():
+    if "-" not in cleaned and len(cleaned) > 1 and cleaned[1:].replace(".", "", 1).isdigit():
         cleaned = f"{cleaned[0]}-{cleaned[1:]}"
 
     match = _STAGE_PATTERN.match(cleaned)
     if not match:
         return None
     letter, number = match.groups()
-    return f"{letter}-{int(number)}" if number else letter
+    if not number:
+        return letter
+    if "." in number:
+        whole, frac = number.split(".")
+        return f"{letter}-{int(whole)}.{frac}"
+    return f"{letter}-{int(number)}"
 
 
-def commissioning_stage_sort_key(stage: str) -> Tuple[str, int]:
+def commissioning_stage_sort_key(stage: str) -> Tuple[str, float]:
     """
-    Sort key so stages order meaningfully: A, A-1, A-2, B, B-1, B-2, ... rather
-    than plain alphabetical (which would put "A-1" before "A" as a string).
-    Unparseable/empty stages sort last.
+    Sort key so stages order meaningfully: A, A-1, A-2, A-3.1, A-3.2, B, ...
+    rather than plain alphabetical (which would put "A-1" before "A" as a
+    string). Unparseable/empty stages sort last.
     """
     normalized = parse_commissioning_stage(stage)
     if not normalized:
-        return ("~", 9999)  # sorts after all real letters
+        return ("~", 9999.0)
     if "-" in normalized:
         letter, number = normalized.split("-")
-        return (letter, int(number))
-    return (normalized, 0)
+        return (letter, float(number))
+    return (normalized, 0.0)
 
 # =============================================================================
 # PPIA LOG (Process Protection and Interlock Actuation)
