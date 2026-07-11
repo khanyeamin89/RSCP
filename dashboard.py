@@ -39,6 +39,7 @@ from config import (
     UNIT_CODES,
     FUNCTION_KEY_LEGEND,
     EQUIPMENT_TYPE_LEGEND,
+    COMPONENT_TYPE_LEGEND,
     BUILDING_CODES,
     SYSTEM_CODES,
     REGISTRY_SCHEMA,
@@ -1276,15 +1277,29 @@ with tab7:
     st.markdown("---")
 
     # Equipment Type Legend
-    st.markdown("#### Equipment Type Legend (2-letter type code)")
+    st.markdown(f"#### Equipment Unit Codes ({len(EQUIPMENT_TYPE_LEGEND)})")
     sorted_types = sort_by_label(EQUIPMENT_TYPE_LEGEND) if sort_by == "label" else sorted(EQUIPMENT_TYPE_LEGEND.items())
     type_df = pd.DataFrame([{"Type Code": k, "Description": v} for k, v in sorted_types])
     st.dataframe(type_df, width="stretch", hide_index=True)
 
     st.markdown("---")
 
-    # System Codes (searchable — 439 known codes)
+    # Component Codes (new — Section 5 of the source document)
+    st.markdown(f"#### Component Codes ({len(COMPONENT_TYPE_LEGEND)})")
+    st.caption("Component-level detail codes — a separate namespace from Equipment Unit Codes above (KKS reuses the same letters at different code positions with different meanings).")
+    comp_search = st.text_input("Filter component codes", key="comp_code_search", placeholder="e.g. valve, pump, relay")
+    sorted_comps = sort_by_label(COMPONENT_TYPE_LEGEND) if sort_by == "label" else sorted(COMPONENT_TYPE_LEGEND.items())
+    comp_df = pd.DataFrame([{"Component Code": k, "Description": v} for k, v in sorted_comps])
+    if comp_search:
+        mask = comp_df["Component Code"].str.contains(comp_search, case=False, na=False) | comp_df["Description"].str.contains(comp_search, case=False, na=False)
+        comp_df = comp_df[mask]
+    st.dataframe(comp_df, width="stretch", hide_index=True, height=300)
+
+    st.markdown("---")
+
+    # System Codes (searchable — Reactor Shop scope)
     st.markdown(f"#### Known System Codes ({len(SYSTEM_CODES)})")
+    st.caption("Reactor Shop scope (J/K groups + cross-referenced Q/S systems). Source: RPR-QM-AEB0001 B05.")
     sys_search = st.text_input("Filter system codes", key="sys_code_search", placeholder="e.g. JAA, cooling, pump")
     sorted_systems = sort_by_label({k: v[0] for k, v in SYSTEM_CODES.items()}) if sort_by == "label" else sorted(SYSTEM_CODES.items())
     sys_rows = [{"System Code": k, "Description": (v[0] if isinstance(v, tuple) else v), "Function Key": (v[1] if isinstance(v, tuple) else SYSTEM_CODES.get(k, ("", ""))[1])} for k, v in (sorted_systems if sort_by == "label" else SYSTEM_CODES.items())]
@@ -1296,8 +1311,9 @@ with tab7:
 
     st.markdown("---")
 
-    # Building Codes (searchable — 257 known codes)
+    # Building Codes (searchable — Reactor Shop scope)
     st.markdown(f"#### Known Building Codes ({len(BUILDING_CODES)})")
+    st.caption("Reactor Shop scope (UJ/UK building series). Source: RPR-QM-AEB0001 B05.")
     bld_search = st.text_input("Filter building codes", key="bld_code_search", placeholder="e.g. 10UJA, ventilation")
     sorted_buildings = sort_by_label(BUILDING_CODES) if sort_by == "label" else sorted(BUILDING_CODES.items())
     bld_df = pd.DataFrame([{"Building Code": k, "Description": v} for k, v in sorted_buildings])
