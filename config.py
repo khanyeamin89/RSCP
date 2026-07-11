@@ -379,7 +379,7 @@ SYSTEM_CODES: Dict[str, Tuple[str, str]] = {
     "KBE": ("Coolant purification system", "K"),
     "KBF": ("Coolant treatment system", "K"),
     "KBH": ("Fuel pool water purification system", "K"),
-    "LCQ": ("Steam Generator Blowdown Water Purification System", "L")
+    "LCQ": ("Steam Generator Blowdown Water Purification System", "L"),
     "KLA": ("Ventilation system of the 10UJA (20UJA) buildings", "K"),
     "KLB": ("Ventilation system of the 10UJB (20UJB) buildings", "K"),
     "KLC": ("Ventilation system of the 10UKA (20UKA) buildings", "K"),
