@@ -8,6 +8,7 @@ KKS Coding based on the Rooppur NPP Reactor Shop KKS Code Master List
 """
 
 import json
+import re
 import hashlib
 import time
 import streamlit as st
@@ -63,12 +64,21 @@ KKS CODING RULES (Rooppur NPP Reactor Shop KKS Code Master List):
   (other 2-digit unit codes exist for shared/auxiliary facility zones)
 - System code function keys (1st letter of the system code): {fkey_lines}
 - Common equipment type codes (2 letters, precede the 3-digit sequence number): {common_types}
-- Milestones (COMMISSIONING TESTS - apply to ALL scope types): IT=Individual Test, PIC=Post-Install Cleaning, HT=Hydro Test, PT=Pneumatic Test, SAW=Start-up & Adjustment
-- PPIA = Process Protection and Interlock Actuation. This is DIFFERENT from the 5 milestones above:
+- Milestones (COMMISSIONING TESTS - apply to ALL scope types): IT=Individual Test, PIC=Post-Install Cleaning, HT=Hydro Test, PT=Pneumatic Test, SAW=Start-up & Adjustment, P1/P2/P3=Protocol Part 1/2/3 sign-off (paperwork tracking, e.g. "P-3 not signed", "P-1 is checked" — a document being collected/submitted/signed, not a physical test)
+- PPIA = Process Protection and Interlock Actuation. This is DIFFERENT from the milestones above:
   a PPIA entry is a discrete EVENT report (a protection system tripped, an interlock actuated, a
   protection alarm occurred) — not a pass/fail commissioning test status. Look for language like
   "interlock actuated", "protection trip", "PPIA", "reactor trip on...", "actuation of...",
   "protection system alarmed", etc. Extract each such event as its own entry.
+- MULTIPLE CODES IN ONE CELL/SENTENCE: source text often lists several KKS/equipment codes
+  together, comma-separated, e.g. "12KAA20AA801, 802, 12KAA10AA801" or "01UYP, 02UYP, 03UYP".
+  Create ONE SEPARATE record per code, not one record covering all of them. When a later code in
+  the list is just a short suffix (e.g. "802" or "12" following a full code), it means "same
+  prefix as the previous full code, only the trailing part changed" — reconstruct the full code
+  by combining it with the immediately preceding full code's prefix. Example: "12KAA20AA801, 802"
+  means two equipment codes: 12KAA20AA801 AND 12KAA20AA802 (both get their own record). Example:
+  "01UYP, 02UYP, 03UYP" are three already-complete building codes — no reconstruction needed,
+  just three separate records.
 
 OUTPUT FORMAT:
 {{
@@ -78,7 +88,7 @@ OUTPUT FORMAT:
             "system_kks": "Full KKS code including the mandatory 2-digit Unit prefix",
             "scope_type": "System|Equipment|Building",
             "component": "Component Tag",
-            "commissioning_stage": "Stage code if present in source (e.g. A, A-1, B, B-2), else empty string",
+            "commissioning_stage": "Stage code if present in source (e.g. A, A-1, A-3.1, B-2), else empty string",
             "it_status": "Pending|In Progress|Completed|Failed|N/A",
             "it_date": "YYYY-MM-DD or empty string if not found",
             "pic_status": "Pending|In Progress|Completed|Failed|N/A",
@@ -89,6 +99,12 @@ OUTPUT FORMAT:
             "pt_date": "YYYY-MM-DD or empty string if not found",
             "saw_status": "Pending|In Progress|Completed|Failed|N/A",
             "saw_date": "YYYY-MM-DD or empty string if not found",
+            "p1_status": "Pending|In Progress|Completed|Failed|N/A",
+            "p1_date": "YYYY-MM-DD or empty string if not found",
+            "p2_status": "Pending|In Progress|Completed|Failed|N/A",
+            "p2_date": "YYYY-MM-DD or empty string if not found",
+            "p3_status": "Pending|In Progress|Completed|Failed|N/A",
+            "p3_date": "YYYY-MM-DD or empty string if not found",
             "comments": "Any relevant notes including KKS context"
         }}
     ],
@@ -116,7 +132,7 @@ RULES:
 7. Status keywords: "failed", "rejected", "issue" -> "Failed"
 8. Status keywords: "pending", "not started", "awaiting" -> "Pending"
 9. If a milestone is not mentioned, default to "Pending".
-10. All 5 milestones (IT, PIC, HT, PT, SAW) apply to ALL scope types. They are commissioning tests.
+10. All milestones (IT, PIC, HT, PT, SAW, P1, P2, P3) apply to ALL scope types.
 11. PIC (Post Installation Cleaning) must precede HT (Hydro Test).
 12. Include any anomalies, KKS code issues, or special notes in "comments".
 13. If scope cannot be determined from KKS, infer from context ("system" vs "equipment" vs "building").
@@ -125,7 +141,9 @@ RULES:
 16. "ppia_events" is a SEPARATE list from "records" — a PPIA event is not a milestone status update. If the source mentions no protection/interlock actuations, output an empty list for "ppia_events".
 17. PPIA "status" field: if the shift note doesn't explicitly characterize the event, default to "Pending Review" rather than guessing "Confirmed" or "False Alarm".
 18. "interlock_description" is required for every PPIA event — if you cannot state clearly what actuated/tripped, do not create the entry.
-19. "commissioning_stage": Rooppur commissioning works are organized into lettered stages with optional numbered sub-stages — A, A-1, A-2, B, B-1, B-2, C, etc. Look for a column or label in the source explicitly named "Stage", "Commissioning Stage", "Phase", or similar, or an inline mention like "Stage A-1" / "Phase B-2". Extract it exactly as given (a letter, optionally followed by a dash and a number). If no stage is stated anywhere for a record, output an empty string — NEVER guess or infer a stage from context.
+19. "commissioning_stage": Rooppur commissioning works are organized into lettered stages with optional numbered sub-stages, including decimal ones — A, A-1, A-2, A-3.1, A-3.2, B, B-1, B-2, etc. Look for a column or label in the source explicitly named "Stage", "Commissioning Stage", "Phase", "Stage of performance", or similar, or an inline mention like "Stage A-1" / "Phase B-2" / "on sub-stage A-1". Extract it exactly as given. If no stage is stated anywhere for a record, output an empty string — NEVER guess or infer a stage from context.
+20. "p1_status"/"p2_status"/"p3_status": these track PROTOCOL DOCUMENT sign-off, distinct from the physical tests. Look for phrases like "Protocol collected", "Protocol submitted", "P-1 signed", "P-3 not signed", "Protocol not submitted". Map: not mentioned/not submitted -> "Pending"; collected but not yet submitted -> "In Progress"; submitted and signed -> "Completed"; rejected/returned -> "Failed".
+21. COMMA-SEPARATED CODE LISTS: never merge multiple codes into a single record's system_kks field. Always split into one record per code, applying the suffix-inheritance reconstruction rule described above where applicable.
 """
 
 
@@ -395,6 +413,93 @@ def smart_chunk_text(text: str, max_chunk_size: int = 8000) -> List[str]:
 # KKS POST-PROCESSING VALIDATION
 # =============================================================================
 
+_KKS_FULL_CODE_RE = re.compile(r'^\d{2}[A-Z]{2,4}\d{2}[A-Z]{2}\d{3}$')
+_KKS_SYSTEM_OR_BUILDING_RE = re.compile(r'^\d{2}(?:U)?[A-Z]{2,4}$')
+_SUFFIX_ONLY_RE = re.compile(r'^\d{2,3}$')  # e.g. "802", "12" — a trailing part only
+
+
+def split_comma_separated_kks(system_kks: str) -> List[str]:
+    """
+    Deterministic safety net for comma-separated KKS lists — doesn't rely on
+    the AI to get this right every time. Real Rooppur source sheets do this
+    routinely, e.g. "12KAA20AA801, 802" (second token is just the trailing
+    sequence number, inheriting the first token's prefix) or "01UYP, 02UYP,
+    03UYP" (already-complete codes, just split on the comma).
+
+    Returns a list of one or more fully-reconstructed KKS codes. If the input
+    has no comma, returns a single-element list unchanged.
+    """
+    if not system_kks or "," not in system_kks:
+        return [system_kks] if system_kks else []
+
+    tokens = [t.strip() for t in system_kks.split(",") if t.strip()]
+    if not tokens:
+        return []
+
+    result: List[str] = []
+    last_full_prefix = None  # the "stem" to reuse for abbreviated suffix tokens
+
+    for tok in tokens:
+        tok_clean = tok.upper().replace(" ", "")
+
+        if _KKS_FULL_CODE_RE.match(tok_clean):
+            result.append(tok_clean)
+            # stem = everything except the trailing 3-digit sequence number
+            last_full_prefix = tok_clean[:-3]
+        elif _KKS_SYSTEM_OR_BUILDING_RE.match(tok_clean):
+            # Already a complete system/building code — no reconstruction needed
+            result.append(tok_clean)
+            last_full_prefix = None
+        elif _SUFFIX_ONLY_RE.match(tok_clean) and last_full_prefix:
+            # Abbreviated suffix — inherit the previous full code's prefix
+            seq_len = len(tok_clean)
+            padded = tok_clean.zfill(3) if seq_len <= 3 else tok_clean
+            result.append(f"{last_full_prefix}{padded}")
+        else:
+            # Unrecognized shape — keep as-is rather than silently dropping it;
+            # downstream KKS validation will flag it for manual review.
+            result.append(tok_clean)
+            last_full_prefix = None
+
+    return result
+
+
+def expand_comma_separated_records(record: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """
+    If a record's system_kks (or component) contains comma-separated codes,
+    expands it into multiple independent records — one per code — instead of
+    silently treating a multi-code cell as a single record. This is the
+    deterministic backstop behind rule #21 in the system prompt; the AI is
+    asked to do this splitting itself, but real source sheets are messy
+    enough that a Python-level check catches anything the AI merges by mistake.
+
+    Returns:
+        (list of one or more records, list of info alerts)
+    """
+    alerts: List[str] = []
+    kks_raw = record.get("system_kks", "")
+
+    if not kks_raw or "," not in kks_raw:
+        return [record], alerts
+
+    expanded_codes = split_comma_separated_kks(kks_raw)
+    if len(expanded_codes) <= 1:
+        return [record], alerts
+
+    alerts.append(
+        f"SPLIT: '{kks_raw}' contained {len(expanded_codes)} comma-separated codes — "
+        f"expanded into {len(expanded_codes)} separate records: {', '.join(expanded_codes)}"
+    )
+
+    expanded_records = []
+    for code in expanded_codes:
+        new_record = dict(record)
+        new_record["system_kks"] = code
+        expanded_records.append(new_record)
+
+    return expanded_records, alerts
+
+
 def post_process_kks_record(record: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
     """
     Post-processes an AI-extracted record by running it through the single,
@@ -523,12 +628,20 @@ def process_file_smart(file_bytes: bytes, file_name: str, force_reprocess: bool 
             progress_bar.progress((i + 1) / len(chunks))
             continue
 
-        records = data.get("records", [])
-        if not records and all(k in data for k in ('system', 'system_kks', 'component')):
-            records = [data]
+        raw_records = data.get("records", [])
+        if not raw_records and all(k in data for k in ('system', 'system_kks', 'component')):
+            raw_records = [data]
         ppia_events = data.get("ppia_events", [])
 
-        st.info(f"Chunk {i+1}: Extracted {len(records)} record(s), {len(ppia_events)} PPIA event(s).")
+        # Expand any comma-separated multi-code records into individual ones
+        # BEFORE counting/processing, so "12KAA20AA801, 802" becomes 2 records.
+        records = []
+        for raw_record in raw_records:
+            expanded, split_alerts = expand_comma_separated_records(raw_record)
+            records.extend(expanded)
+            all_alerts.extend(split_alerts)
+
+        st.info(f"Chunk {i+1}: Extracted {len(records)} record(s) (after comma-split), {len(ppia_events)} PPIA event(s).")
 
         for record in records:
             record, kks_alerts = post_process_kks_record(record)
@@ -578,14 +691,22 @@ def parse_shift_notes(notes_text: str) -> Tuple[List[Dict[str, Any]], List[Dict[
     if data is None:
         return [], [], ["ERROR: AI extraction failed"]
 
-    records = data.get("records", [])
-    if not records and all(k in data for k in ('system', 'system_kks', 'component')):
-        records = [data]
+    raw_records = data.get("records", [])
+    if not raw_records and all(k in data for k in ('system', 'system_kks', 'component')):
+        raw_records = [data]
     ppia_events_raw = data.get("ppia_events", [])
 
     alerts: List[str] = []
     validated_records: List[Dict[str, Any]] = []
     validated_ppia_events: List[Dict[str, Any]] = []
+
+    # Expand any comma-separated multi-code records into individual ones
+    # BEFORE validation, so "12KAA20AA801, 802" becomes 2 records.
+    records = []
+    for raw_record in raw_records:
+        expanded, split_alerts = expand_comma_separated_records(raw_record)
+        records.extend(expanded)
+        alerts.extend(split_alerts)
 
     for record in records:
         kks = record.get('system_kks', '')
