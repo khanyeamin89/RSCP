@@ -1004,24 +1004,32 @@ def parse_kks(kks_code: str) -> KKSParseResult:
         if sys_entry:
             sys_desc, fkey = sys_entry
         else:
+            # Not in our (Reactor-Shop-scoped) reference tables — this does
+            # NOT mean the code is invalid, just that it's outside what we've
+            # extracted so far (e.g. turbine/electrical/BOP systems). A
+            # well-formed KKS shape is accepted and flagged for manual
+            # verification rather than hard-rejected — mirrors how the
+            # Equipment branch above already handles this. Hard-rejecting
+            # here previously caused every code outside the Reactor Shop
+            # J/K/U scope to be silently dropped during import.
             fkey = system[0]
             fkey_desc = FUNCTION_KEY_LEGEND.get(fkey)
-            if not fkey_desc:
-                return KKSParseResult(
-                    valid=False, raw=code,
-                    message=(
-                        f"Unknown KKS code '{code}'. System code '{system}' not found in the KKS "
-                        f"master list and function key '{fkey}' is not a recognized function key "
-                        f"({', '.join(sorted(FUNCTION_KEY_LEGEND.keys()))})."
-                    ),
+            if fkey_desc:
+                sys_desc = fkey_desc
+                alerts.append(
+                    f"System code '{system}' not found in KKS master list; "
+                    f"function key '{fkey}' = {fkey_desc}. Verify system code against master list."
                 )
-            sys_desc = fkey_desc
-            alerts.append(
-                f"System code '{system}' not found in KKS master list; "
-                f"function key '{fkey}' = {fkey_desc}. Verify system code against master list."
-            )
+            else:
+                sys_desc = ""
+                alerts.append(
+                    f"System code '{system}' and function key '{fkey}' are both outside the "
+                    f"currently-extracted KKS reference scope (Reactor Shop J/K/U + cross-refs). "
+                    f"The code is structurally valid but unverified — confirm against the master "
+                    f"list (RPR-QM-AEB0001) before relying on it."
+                )
         unit_desc = describe_unit(unit)
-        message = f"Valid System KKS: Unit={unit} ({unit_desc}), System={system} ({sys_desc})"
+        message = f"Valid System KKS: Unit={unit} ({unit_desc}), System={system}" + (f" ({sys_desc})" if sys_desc else "")
         return KKSParseResult(
             valid=True, scope=ScopeType.SYSTEM, raw=code, unit=unit, unit_desc=unit_desc,
             system_code=system, system_desc=sys_desc, function_key=fkey,
