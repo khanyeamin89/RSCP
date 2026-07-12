@@ -27,6 +27,7 @@ from config import (
     EQUIPMENT_TYPE_LEGEND,
     MILESTONES,
     MILESTONE_LABELS,
+    MILESTONE_DATE_FIELDS,
     VALID_STATUSES,
     parse_commissioning_stage,
     validate_ppia_entry,
