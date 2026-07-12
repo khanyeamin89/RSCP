@@ -1,14 +1,15 @@
 # ------------------------------------------------------------------------------
-# CORE FRAMEWORK - Streamlit (UI + session state + caching)
-# ------------------------------------------------------------------------------
-streamlit
-# ------------------------------------------------------------------------------
-# DATABASE - Supabase (PostgreSQL backend)
-# ------------------------------------------------------------------------------
-supabase
-postgrest
-# ------------------------------------------------------------------------------
 # DATA PROCESSING - Pandas / NumPy / PyArrow
+# pyarrow is pinned deliberately: Streamlit's own tracker confirms Python 3.14
+# needs pyarrow==22.0.0 (streamlit/streamlit#12892) — anything newer resolves
+# automatically and causes a native segfault on startup, before any app code
+# even runs. This is not optional.
+# pandas is pinned below 3.0 since pandas 3.x is brand new (2026) and hasn't
+# been broadly validated against pyarrow 22 yet.
+# ------------------------------------------------------------------------------
+pandas==2.2.3
+numpy
+pyarrow==22.0.0
 # pyarrow>=22 is required for Python 3.14 wheel support (versions below 22
 # have no cp314 wheel at all). Deliberately a RANGE, not an exact pin: an
 # exact old pin (e.g. ==22.0.0) risks the installer not finding a wheel for
@@ -17,21 +18,21 @@ postgrest
 # ("stuck in the oven"). A range lets the resolver pick whatever compatible
 # version actually has a working wheel.
 # ------------------------------------------------------------------------------
-pandas
-numpy
-pyarrow
+pandas>=2.2,<3.0
+numpy>=1.26,<2.0
+pyarrow>=22,<26
 
 # ------------------------------------------------------------------------------
 # AI ENGINE - Mistral API integration (via requests, no SDK needed)
 # ------------------------------------------------------------------------------
-requests
+requests==2.32.3
 
 # ------------------------------------------------------------------------------
 # FILE PARSING - Excel support
 # ------------------------------------------------------------------------------
-openpyxl
+openpyxl==3.1.5
 
 # ------------------------------------------------------------------------------
 # CHARTS - Matplotlib (timeline / milestone visualizations)
 # ------------------------------------------------------------------------------
-matplotlib
+matplotlib==3.9.2
