@@ -67,7 +67,7 @@ from database import (
     load_milestone_history_for,
     clear_milestone_history,
 )
-from ai_engine import process_file_smart, parse_shift_notes
+from ai_engine import process_file_smart, parse_shift_notes, get_sheet_names
 
 # =============================================================================
 # TIMELINE CHART HELPER
@@ -522,6 +522,26 @@ with tab2:
     )
 
     if uploaded:
+        selected_sheets = None
+        if uploaded.name.lower().endswith(('.xlsx', '.xls')):
+            sheet_names = get_sheet_names(uploaded.getvalue(), uploaded.name)
+            if len(sheet_names) > 1:
+                st.markdown("#### Select sheets to import")
+                st.caption(
+                    "Multi-sheet file detected. Deselect title pages, approval-routing sheets, "
+                    "or summary/statistics sheets to avoid burning AI calls on non-data content — "
+                    "especially important for large files, since each excluded sheet means fewer "
+                    "chunks and a faster, cheaper import."
+                )
+                selected_sheets = st.multiselect(
+                    "Sheets",
+                    options=sheet_names,
+                    default=sheet_names,
+                    key="import_sheet_select",
+                )
+                if not selected_sheets:
+                    st.warning("Select at least one sheet to import.")
+
         force_reprocess = st.checkbox(
             "Force reprocess (ignore chunk cache)",
             key="force_reprocess_chk",
@@ -535,10 +555,13 @@ with tab2:
         with col1:
             process_btn = st.button("Run Token-Efficient Sync", type="primary", width="stretch")
 
-        if process_btn:
+        if process_btn and (selected_sheets is None or len(selected_sheets) > 0):
             with st.spinner("Processing file with Rooppur NPP KKS validation..."):
                 file_bytes = uploaded.getvalue()
-                records_processed, alerts = process_file_smart(file_bytes, uploaded.name, force_reprocess=force_reprocess)
+                records_processed, alerts = process_file_smart(
+                    file_bytes, uploaded.name, force_reprocess=force_reprocess,
+                    selected_sheets=selected_sheets,
+                )
 
             if records_processed > 0:
                 st.success(f"Sync Complete! {records_processed} record(s) processed successfully.")
