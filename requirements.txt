@@ -1,35 +1,38 @@
 # ------------------------------------------------------------------------------
 # CORE FRAMEWORK - Streamlit (UI + session state + caching)
 # ------------------------------------------------------------------------------
-streamlit
+streamlit==1.59.1
+
 # ------------------------------------------------------------------------------
 # DATABASE - Supabase (PostgreSQL backend)
 # ------------------------------------------------------------------------------
-supabase
-postgrest
+supabase==2.31.0
+postgrest==2.31.0
+
 # ------------------------------------------------------------------------------
 # DATA PROCESSING - Pandas / NumPy / PyArrow
 # pyarrow is pinned deliberately: Streamlit's own tracker confirms Python 3.14
-# needs pyarrow==22.0.0 (streamlit/streamlit#12892) — anything newer resolved
-# automatically here previously caused a native segfault on startup.
+# needs pyarrow==22.0.0 (streamlit/streamlit#12892) — anything newer resolves
+# automatically and causes a native segfault on startup, before any app code
+# even runs. This is not optional.
 # pandas is pinned below 3.0 since pandas 3.x is brand new (2026) and hasn't
 # been broadly validated against pyarrow 22 yet.
 # ------------------------------------------------------------------------------
-pandas
-numpy
-pyarrow
+pandas==2.2.3
+numpy==1.26.4
+pyarrow==22.0.0
 
 # ------------------------------------------------------------------------------
 # AI ENGINE - Mistral API integration (via requests, no SDK needed)
 # ------------------------------------------------------------------------------
-requests
+requests==2.32.3
 
 # ------------------------------------------------------------------------------
 # FILE PARSING - Excel support
 # ------------------------------------------------------------------------------
-openpyxl
+openpyxl==3.1.5
 
 # ------------------------------------------------------------------------------
 # CHARTS - Matplotlib (timeline / milestone visualizations)
 # ------------------------------------------------------------------------------
-matplotlib
+matplotlib==3.9.2
