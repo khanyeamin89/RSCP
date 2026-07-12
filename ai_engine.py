@@ -359,7 +359,7 @@ def ask_mistral(prompt: str, max_retries: int = 5, include_ppia: bool = True) ->
 # FILE PARSING
 # =============================================================================
 
-def _detect_header_row(df: "pd.DataFrame", max_scan_rows: int = 8) -> int:
+def _detect_header_row(df: "pd.DataFrame", max_scan_rows: int = 40) -> int:
     """
     Real-world commissioning spreadsheets often have title rows, merged
     bilingual headers, or blank spacer rows before the actual column headers
@@ -371,6 +371,13 @@ def _detect_header_row(df: "pd.DataFrame", max_scan_rows: int = 8) -> int:
     long sentences, while real column headers tend to be short labels. This
     disambiguates cases where both a title row and the real header row have
     the same number of filled cells (a plain fill-rate score alone ties).
+
+    max_scan_rows defaults to 40, not just the first handful — some real
+    Rooppur files (e.g. "Overview of the List of task/tests at B-1.2 and
+    B-2...") carry a full summary/stats mini-table (10+ rows, its own
+    "Test type"/"Number" header) ABOVE the real column header row. A short
+    scan window locks onto that mini-table's header instead of the real one,
+    silently mislabeling every real column as generic "ColN" downstream.
     """
     best_row = 0
     best_score = float("-inf")
@@ -387,11 +394,22 @@ def _detect_header_row(df: "pd.DataFrame", max_scan_rows: int = 8) -> int:
     return best_row
 
 
+# Sentinel marking a genuine row/record boundary in the dense text produced
+# below. Deliberately NOT a plain "\n" or "\n\n" — real commissioning sheets
+# routinely have cells (task descriptions, comments, objectives) that are
+# themselves multi-paragraph free text containing their own blank lines, so
+# either of those would be indistinguishable from an actual row boundary.
+# smart_chunk_text() splits on this sentinel (and only this) so a chunk
+# boundary can never fall in the middle of one row's narrative text.
+_RECORD_SEP = "\n\x1e\n"
+
+
 def _dataframe_to_dense_text(df: "pd.DataFrame", sheet_label: str = "") -> str:
     """
     Converts a DataFrame into a compact, AI-friendly "Column: Value" text
-    block — one line per row, only non-empty cells included, real headers
-    detected rather than assumed. This replaces df.to_string(), which pads
+    block — one row per record, only non-empty cells included, real headers
+    detected rather than assumed, records joined with _RECORD_SEP (see above)
+    rather than a plain newline. This replaces df.to_string(), which pads
     every column to its widest cell and was measured to be ~85% pure
     whitespace on real Rooppur tracking sheets (424,871 chars for just 83
     rows of actual data) — that bloat was silently causing files to need
@@ -405,9 +423,9 @@ def _dataframe_to_dense_text(df: "pd.DataFrame", sheet_label: str = "") -> str:
     headers = df.iloc[header_row_idx].fillna("").astype(str).tolist()
     data_rows = df.iloc[header_row_idx + 1:]
 
-    lines = []
+    records = []
     if sheet_label:
-        lines.append(f"=== Sheet: {sheet_label} ===")
+        records.append(f"=== Sheet: {sheet_label} ===")
 
     for _, row in data_rows.iterrows():
         pairs = []
@@ -420,9 +438,9 @@ def _dataframe_to_dense_text(df: "pd.DataFrame", sheet_label: str = "") -> str:
             header = headers[col_idx] if col_idx < len(headers) and headers[col_idx].strip() else f"Col{col_idx}"
             pairs.append(f"{header}: {val_str}")
         if pairs:
-            lines.append(" | ".join(pairs))
+            records.append(" | ".join(pairs))
 
-    return "\n".join(lines)
+    return _RECORD_SEP.join(records)
 
 
 def extract_text_from_file(file_bytes: bytes, file_name: str, selected_sheets: Optional[List[str]] = None) -> str:
@@ -466,7 +484,7 @@ def extract_text_from_file(file_bytes: bytes, file_name: str, selected_sheets: O
             if not text_blocks:
                 st.warning(f"'{file_name}' has no readable data in the selected sheet(s).")
                 return ""
-            return "\n\n".join(text_blocks)
+            return _RECORD_SEP.join(text_blocks)
         except Exception as e:
             st.error(f"Failed to parse Excel file: {str(e)}")
             return ""
@@ -489,46 +507,47 @@ def get_sheet_names(file_bytes: bytes, file_name: str) -> List[str]:
 
 def smart_chunk_text(text: str, max_chunk_size: int = 16000) -> List[str]:
     """
-    Chunks text intelligently by trying to preserve record boundaries.
-    Falls back to character-based chunking if no clear boundaries found.
+    Chunks text by packing whole records (rows) up to ~max_chunk_size,
+    without ever splitting a single record in two.
+
+    Splits ONLY on the explicit _RECORD_SEP sentinel produced by
+    _dataframe_to_dense_text — never on a bare "\\n" or "\\n\\n". Real
+    commissioning-sheet cells are often multi-paragraph free text with their
+    own blank lines, so a naive split on blank lines (the previous approach)
+    would randomly slice a single row's task description in half and hand
+    the two halves to the AI as separate, context-less API calls — one half
+    missing the "Col0/Col1..." identifying prefix entirely. If a single
+    record is itself larger than max_chunk_size (rare — a very long cell),
+    it's still kept intact as its own oversized chunk rather than being cut
+    mid-sentence.
     """
     if not text:
         return []
 
-    records = text.split('\n\n')
+    records = [r for r in text.split(_RECORD_SEP) if r.strip()]
 
     chunks = []
     current_chunk = ""
 
     for record in records:
-        if len(current_chunk) + len(record) + 2 > max_chunk_size:
+        if current_chunk and len(current_chunk) + len(record) + 2 > max_chunk_size:
+            chunks.append(current_chunk.strip())
+            current_chunk = record
+        elif len(record) > max_chunk_size:
+            # This one record alone exceeds the budget. Flush whatever was
+            # pending, then ship the record whole in its own chunk rather
+            # than slicing through the middle of it.
             if current_chunk:
                 chunks.append(current_chunk.strip())
-            current_chunk = record
+                current_chunk = ""
+            chunks.append(record.strip())
         else:
-            current_chunk += "\n\n" + record if current_chunk else record
+            current_chunk = current_chunk + "\n\n" + record if current_chunk else record
 
     if current_chunk:
         chunks.append(current_chunk.strip())
 
-    final_chunks = []
-    for chunk in chunks:
-        if len(chunk) > max_chunk_size:
-            lines = chunk.split('\n')
-            current = ""
-            for line in lines:
-                if len(current) + len(line) + 1 > max_chunk_size:
-                    if current:
-                        final_chunks.append(current.strip())
-                    current = line
-                else:
-                    current += "\n" + line if current else line
-            if current:
-                final_chunks.append(current.strip())
-        else:
-            final_chunks.append(chunk)
-
-    return final_chunks if final_chunks else [text[:max_chunk_size]]
+    return chunks
 
 
 # =============================================================================
