@@ -763,6 +763,53 @@ def post_process_ppia_event(event: Dict[str, Any], source: str = "") -> Tuple[Di
 # MAIN PROCESSING PIPELINE
 # =============================================================================
 
+# =============================================================================
+# LENIENT IMPORT: never drop a record outright, flag it for manual review
+# =============================================================================
+
+def _fill_missing_required_fields(record: Dict[str, Any], unique_tag: str) -> Tuple[Dict[str, Any], List[str]]:
+    """
+    Bulk-import sources (free-form task/test lists, messy trackers) often
+    don't name a clean 'system' + 'component' + KKS code per row the way a
+    structured registry export would. Historically, validate_record()
+    rejected any such record outright — on a file where MOST rows lack a
+    clean component tag, that meant "No records were processed" even though
+    the AI successfully read the file and extracted real content.
+
+    Rather than dropping the record, this fills any missing required field
+    with an obviously-flagged placeholder so the row still lands in the
+    registry and can be fixed by hand in the Registry Editor tab.
+
+    unique_tag must be different for every record in the import batch —
+    REGISTRY_UNIQUE_KEYS is ("system", "component"), so two placeholder
+    records with identical blank-derived values would upsert-collide and
+    silently overwrite one another otherwise.
+    """
+    alerts: List[str] = []
+
+    if not str(record.get("system", "")).strip():
+        record["system"] = f"NEEDS REVIEW ({unique_tag})"
+        alerts.append(
+            f"ALERT: Record {unique_tag} had no identifiable system — saved with a "
+            f"placeholder name. Edit it in the Registry Editor tab."
+        )
+
+    if not str(record.get("component", "")).strip():
+        record["component"] = f"Unidentified — {unique_tag}"
+        alerts.append(
+            f"ALERT: Record {unique_tag} had no identifiable component/tag — saved "
+            f"with a placeholder. Edit it in the Registry Editor tab."
+        )
+
+    if not str(record.get("system_kks", "")).strip():
+        alerts.append(
+            f"ALERT: Record {unique_tag} had no KKS code — saved without one. "
+            f"Add it manually in the Registry Editor tab if one applies."
+        )
+
+    return record, alerts
+
+
 def process_file_smart(file_bytes: bytes, file_name: str, force_reprocess: bool = False,
                         selected_sheets: Optional[List[str]] = None) -> Tuple[int, List[str]]:
     """
@@ -845,14 +892,20 @@ def process_file_smart(file_bytes: bytes, file_name: str, force_reprocess: bool 
 
         st.info(f"Chunk {i+1}: Extracted {len(records)} record(s) (after comma-split).")
 
-        for record in records:
+        for j, record in enumerate(records):
             record, kks_alerts = post_process_kks_record(record)
             all_alerts.extend(kks_alerts)
 
             dep_issues = validate_milestone_dependencies(record)
             all_alerts.extend(dep_issues)
 
-            ok, msgs = upsert_registry_row(record)
+            # Lenient import: a record missing a clean system/component/KKS
+            # is still saved (flagged with a placeholder) rather than
+            # dropped outright — see _fill_missing_required_fields docstring.
+            record, fill_alerts = _fill_missing_required_fields(record, unique_tag=f"chunk{i+1}-row{j+1}")
+            all_alerts.extend(fill_alerts)
+
+            ok, msgs = upsert_registry_row(record, skip_validation=True)
             all_alerts.extend(msgs)
             if ok:
                 total_processed += 1
