@@ -1,26 +1,29 @@
 # ------------------------------------------------------------------------------
-# DATA PROCESSING - Pandas / NumPy / PyArrow
-# pyarrow is pinned deliberately: Streamlit's own tracker confirms Python 3.14
-# needs pyarrow==22.0.0 (streamlit/streamlit#12892) — anything newer resolves
-# automatically and causes a native segfault on startup, before any app code
-# even runs. This is not optional.
-# pandas is pinned below 3.0 since pandas 3.x is brand new (2026) and hasn't
-# been broadly validated against pyarrow 22 yet.
+# CORE FRAMEWORK - Streamlit (UI + session state + caching)
 # ------------------------------------------------------------------------------
-pandas==2.2.3
-numpy
-pyarrow==22.0.0
-# pyarrow>=22 is required for Python 3.14 wheel support (versions below 22
-# have no cp314 wheel at all). Deliberately a RANGE, not an exact pin: an
-# exact old pin (e.g. ==22.0.0) risks the installer not finding a wheel for
-# this exact patch version and falling back to a from-source build of
-# pyarrow's C++ codebase, which can hang the build for a very long time
-# ("stuck in the oven"). A range lets the resolver pick whatever compatible
-# version actually has a working wheel.
+streamlit==1.59.1
+
+# ------------------------------------------------------------------------------
+# DATABASE - Supabase (PostgreSQL backend)
+# ------------------------------------------------------------------------------
+supabase==2.31.0
+postgrest==2.31.0
+
+# ------------------------------------------------------------------------------
+# DATA PROCESSING - Pandas / NumPy / PyArrow
+#
+# Deployment is now pinned to Python 3.11 via runtime.txt, which is a
+# well-established, thoroughly battle-tested interpreter version. The
+# previous pyarrow>=22 floor existed ONLY to get wheels compatible with
+# Python 3.14 — an interpreter released only months ago, whose ecosystem
+# of compiled C-extension packages (pyarrow, numpy, pydantic-core used by
+# supabase/postgrest) is far less tested and more prone to exactly the kind
+# of silent segfault this app was hitting. On 3.11, a mainstream, far more
+# battle-tested range is both sufficient and safer.
 # ------------------------------------------------------------------------------
 pandas>=2.2,<3.0
 numpy>=1.26,<2.0
-pyarrow>=22,<26
+pyarrow>=14,<18
 
 # ------------------------------------------------------------------------------
 # AI ENGINE - Mistral API integration (via requests, no SDK needed)
