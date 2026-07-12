@@ -573,6 +573,25 @@ with tab2:
                     selected_sheets=selected_sheets,
                 )
 
+            # Stash the result and force a full rerun. Streamlit executes the
+            # whole script top-to-bottom on every run, and TAB 1 (Analytics
+            # Dashboard) is defined ABOVE this block, so it already loaded
+            # load_registry_df() earlier in *this same* run — before the
+            # upserts above even happened. Without an explicit rerun here,
+            # the freshly-synced data doesn't show up on the Analytics tab
+            # until something else happens to trigger another run (matches
+            # the st.rerun() pattern used after every other commit action in
+            # this app, e.g. "Commit Records to Registry" below).
+            st.session_state.last_sync_result = {
+                "records_processed": records_processed,
+                "alerts": alerts,
+            }
+            st.rerun()
+
+        if "last_sync_result" in st.session_state:
+            records_processed = st.session_state.last_sync_result["records_processed"]
+            alerts = st.session_state.last_sync_result["alerts"]
+
             if records_processed > 0:
                 st.success(f"Sync Complete! {records_processed} record(s) processed successfully.")
             else:
