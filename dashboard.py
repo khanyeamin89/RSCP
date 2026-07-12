@@ -30,6 +30,7 @@ from config import (
     validate_record,
     ScopeType,
     MILESTONES,
+    PHYSICAL_TEST_MILESTONES,
     MILESTONE_LABELS,
     MILESTONE_DATE_FIELDS,
     VALID_STATUSES,
@@ -61,6 +62,7 @@ from database import (
     load_ppia_log,
     load_ppia_log_df,
     insert_ppia_batch,
+    update_ppia_batch,
     clear_ppia_log,
     load_milestone_history_for,
     clear_milestone_history,
@@ -121,6 +123,11 @@ def render_date_timeline(points: List[Dict[str, Any]], title: str = "",
     stems, everything anchored right at the point itself. Status color-coding:
     green=Pass, red=Fail, yellow=Ongoing, gray=Postponed/unknown.
 
+    When two or more points share the exact same date, they'd otherwise draw
+    directly on top of each other — instead they're stacked vertically (one
+    on top of the next, connected by a thin stem back down to the line) so
+    every point stays visible rather than overlapping.
+
     Args:
         points: list of {"date": datetime.date, "label": str, "status": str}
                 Only points with a real date are plotted; caller should filter
@@ -128,6 +135,7 @@ def render_date_timeline(points: List[Dict[str, Any]], title: str = "",
         title: chart title
     """
     import matplotlib.dates as mdates
+    from collections import defaultdict
 
     fig, ax = plt.subplots(figsize=(fig_width, fig_height))
 
@@ -142,24 +150,41 @@ def render_date_timeline(points: List[Dict[str, Any]], title: str = "",
     valid_points = sorted(valid_points, key=lambda p: p["date"])
     dates = [p["date"] for p in valid_points]
 
+    # Group points sharing the exact same date so they can be stacked
+    # vertically instead of overlapping at the same x position.
+    by_date = defaultdict(list)
+    for p in valid_points:
+        by_date[p["date"]].append(p)
+
+    STACK_STEP = 0.75  # vertical spacing between stacked points on the same date
+    max_stack = max(len(v) for v in by_date.values())
+
     # The single continuous horizontal line, all points sit directly on it
     ax.plot([dates[0], dates[-1]], [0, 0], color="#cbd5e1", linewidth=2.5, zorder=1,
             solid_capstyle="round")
 
-    for p in valid_points:
-        color = _status_to_dot_color(p.get("status", ""))
-        d = p["date"]
-        label = p.get("label", "")
+    for d, group in by_date.items():
+        for stack_idx, p in enumerate(group):
+            y = stack_idx * STACK_STEP
+            color = _status_to_dot_color(p.get("status", ""))
+            label = p.get("label", "")
 
-        ax.scatter([d], [0], s=650, color=color, edgecolor="white", linewidth=2, zorder=3)
-        # Label inside the circle
-        ax.text(d, 0, label, ha="center", va="center", fontsize=9, fontweight="bold",
-                 color="white", zorder=4)
-        # Date directly beneath the same point
+            if stack_idx > 0:
+                # Thin connector stem back down to the timeline so it's clear
+                # this stacked point still belongs to the same date.
+                ax.plot([d, d], [0, y], color="#cbd5e1", linewidth=1, zorder=2, linestyle=":")
+
+            ax.scatter([d], [y], s=650, color=color, edgecolor="white", linewidth=2, zorder=3)
+            # Label inside the circle
+            ax.text(d, y, label, ha="center", va="center", fontsize=9, fontweight="bold",
+                     color="white", zorder=4)
+
+        # Date shown once beneath the bottom-most point in the stack (all
+        # points in the group share this date, no need to repeat it per point)
         ax.text(d, -0.28, d.strftime("%d %b %Y"), ha="center", va="top",
                  fontsize=8, color="#334155", zorder=4)
 
-    ax.set_ylim(-0.6, 0.6)
+    ax.set_ylim(-0.6, max(0.6, (max_stack - 1) * STACK_STEP + 0.6))
     ax.set_yticks([])
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%d %b %Y"))
     fig.autofmt_xdate(rotation=30, ha="right")
@@ -333,10 +358,11 @@ with tab1:
 
         with col_left:
             st.subheader("Milestone Status Distribution")
+            st.caption("Physical tests only (P-1–P-9 protocol sign-off tracked separately — see Registry Editor).")
             if 'it_status' in df.columns:
-                status_summary = {ms.replace('_status', '').upper(): {} for ms in MILESTONES}
+                status_summary = {ms.replace('_status', '').upper(): {} for ms in PHYSICAL_TEST_MILESTONES}
 
-                for ms in MILESTONES:
+                for ms in PHYSICAL_TEST_MILESTONES:
                     ms_label = ms.replace('_status', '').upper()
                     for status in ['Completed', 'In Progress', 'Pending', 'Failed', 'N/A']:
                         count = 0
@@ -375,15 +401,17 @@ with tab1:
 
         # --- Clickable milestone drill-down: "show which milestone is fully
         # complete" — pick a milestone, see exactly which records have it
-        # marked Completed (and which don't, on request).
+        # marked Completed (and which don't, on request). Physical tests
+        # only — P-1 through P-9 protocol sign-off is tracked in the
+        # Registry Editor / Manual Entry instead, to keep this focused.
         st.subheader("Milestone Completion Drill-Down")
         st.caption("Select a milestone below to see exactly which records have it fully completed.")
 
-        milestone_pill_cols = st.columns(len(MILESTONES))
+        milestone_pill_cols = st.columns(len(PHYSICAL_TEST_MILESTONES))
         if "analytics_selected_milestone" not in st.session_state:
             st.session_state.analytics_selected_milestone = None
 
-        for idx, ms in enumerate(MILESTONES):
+        for idx, ms in enumerate(PHYSICAL_TEST_MILESTONES):
             short_label = MILESTONE_LABELS.get(ms, ms).split(" (")[0]
             completed_n = (df[ms] == 'Completed').sum() if ms in df.columns else 0
             with milestone_pill_cols[idx]:
@@ -1201,14 +1229,17 @@ with tab6:
             hcol1.metric("KKS Code", dt_kks)
             hcol2.metric("Scope", dt_record.get('scope_type', 'Unknown'))
             hcol3.metric("Commissioning Stage", stage_display)
-            statuses_now = [dt_record.get(ms, "Pending") for ms in MILESTONES]
+            statuses_now = [dt_record.get(ms, "Pending") for ms in PHYSICAL_TEST_MILESTONES]
             completed_count = sum(1 for s in statuses_now if s == "Completed")
-            hcol4.metric("Milestones Complete", f"{completed_count}/{len(MILESTONES)}")
+            hcol4.metric("Tests Complete", f"{completed_count}/{len(PHYSICAL_TEST_MILESTONES)}",
+                         help="Physical tests only (IT/PIC/HT/PT/SAW). P-1–P-9 protocol sign-off "
+                              "is tracked separately in the Registry Editor.")
 
-            with st.expander("Fill in missing milestone dates (optional)", expanded=False):
+            with st.expander("Fill in missing test dates (optional)", expanded=False):
+                st.caption("Physical tests only — P-1–P-9 protocol dates can be filled in via the Registry Editor.")
                 edited_dates = {}
-                cols = st.columns(len(MILESTONES))
-                for idx, ms in enumerate(MILESTONES):
+                cols = st.columns(len(PHYSICAL_TEST_MILESTONES))
+                for idx, ms in enumerate(PHYSICAL_TEST_MILESTONES):
                     date_field = MILESTONE_DATE_FIELDS[ms]
                     existing = _parse_date_str(dt_record.get(date_field))
                     short_label = MILESTONE_LABELS.get(ms, ms).split(" (")[0]
@@ -1222,7 +1253,7 @@ with tab6:
                 if st.button("Save entered dates to registry", key="save_dates_single"):
                     updated_record = dict(dt_record)
                     any_saved = False
-                    for ms in MILESTONES:
+                    for ms in PHYSICAL_TEST_MILESTONES:
                         date_field = MILESTONE_DATE_FIELDS[ms]
                         val = edited_dates.get(ms)
                         if val:
@@ -1239,7 +1270,11 @@ with tab6:
                     else:
                         st.info("No new dates entered.")
 
-            history_events = load_milestone_history_for(dt_kks, dt_record.get('component', ''))
+            # Physical tests only — filter out P-1–P-9 protocol history so the
+            # graph stays focused on physical test progress (the same fields
+            # remain fully trackable/editable elsewhere, just not graphed here).
+            all_history_events = load_milestone_history_for(dt_kks, dt_record.get('component', ''))
+            history_events = [ev for ev in all_history_events if ev.get("milestone") in PHYSICAL_TEST_MILESTONES]
 
             points = []
             if history_events:
@@ -1253,13 +1288,13 @@ with tab6:
                         })
                 st.caption(
                     f"Showing all {len(history_events)} recorded test attempt(s) for this record — "
-                    f"every retest is preserved, not just the latest."
+                    f"every retest is preserved, not just the latest. (Physical tests only.)"
                 )
             else:
                 # No history logged yet for this record (e.g. it predates this
                 # feature, or was bulk-imported before any change occurred) —
                 # fall back to showing the current single snapshot per milestone.
-                for ms in MILESTONES:
+                for ms in PHYSICAL_TEST_MILESTONES:
                     date_field = MILESTONE_DATE_FIELDS[ms]
                     d = edited_dates.get(ms) or _parse_date_str(dt_record.get(date_field))
                     points.append({
@@ -1267,7 +1302,7 @@ with tab6:
                         "label": MILESTONE_LABELS.get(ms, ms).split(" (")[0],
                         "status": dt_record.get(ms, "Pending"),
                     })
-                st.caption("No retest history logged yet for this record — showing the current status of each milestone.")
+                st.caption("No retest history logged yet for this record — showing the current status of each physical test.")
 
             stage_suffix = f"  |  Stage {stage_display}" if stage_display != "Not set" else ""
             fig_dt = render_date_timeline(
@@ -1525,15 +1560,16 @@ with tab9:
     st.markdown("""
     A running log of protection/interlock actuation events — reactor trips, interlock
     actuations, protection system alarms — captured automatically from the **Shift Note
-    Parser** and **Data Import & Sync** tabs, or entered manually below. This is a
-    separate, append-only log from the main commissioning registry.
+    Parser** (only), or entered manually below. This is a separate log from the main
+    commissioning registry. **Edit any cell directly in the table below** — changes save
+    when you click "Save Changes to PPIA Log".
     """)
 
     ppia_df = load_ppia_log_df()
 
     if ppia_df.empty:
         st.info("No PPIA events logged yet. They'll appear here automatically once the "
-                 "Shift Note Parser or file import detects one, or add one manually below.")
+                 "Shift Note Parser detects one, or add one manually below.")
     else:
         # --- Summary metrics ---
         m1, m2, m3, m4 = st.columns(4)
@@ -1570,8 +1606,33 @@ with tab9:
                     mask = mask | filtered_ppia[c].astype(str).str.lower().str.contains(search_lower, na=False)
                 filtered_ppia = filtered_ppia[mask]
 
-        st.markdown(f"**Showing {len(filtered_ppia)} of {len(ppia_df)} events**")
-        st.dataframe(filtered_ppia, width="stretch", hide_index=True)
+        st.markdown(f"**Showing {len(filtered_ppia)} of {len(ppia_df)} events — edit directly below**")
+
+        # "id" and "created_at" are needed to save edits back to the right row,
+        # but shouldn't be hand-edited — keep them visible-but-disabled rather
+        # than hiding them, so it's clear which row is which when scanning.
+        editor_column_config = {
+            "status": st.column_config.SelectboxColumn(options=sorted(PPIA_STATUSES)),
+        }
+        disabled_cols = [c for c in ["id", "created_at"] if c in filtered_ppia.columns]
+
+        edited_ppia_df = st.data_editor(
+            filtered_ppia,
+            width="stretch",
+            hide_index=True,
+            key="ppia_log_editor",
+            column_config=editor_column_config,
+            disabled=disabled_cols,
+        )
+
+        if st.button("Save Changes to PPIA Log", type="primary", key="save_ppia_edits"):
+            edited_rows = edited_ppia_df.to_dict("records")
+            success, msgs = update_ppia_batch(edited_rows)
+            st.success(f"Updated {success}/{len(edited_rows)} PPIA event(s).")
+            for m in msgs:
+                if m.startswith("ERROR") or m.startswith("VALIDATION"):
+                    st.error(m)
+            st.rerun()
 
     st.markdown("---")
     st.markdown("#### Log a PPIA Event Manually")
