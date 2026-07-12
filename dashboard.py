@@ -10,6 +10,16 @@ KKS Coding based on Rooppur NPP document RPR-QM-AEB0001 Revision B05 (2017)
 
 import streamlit as st
 import pandas as pd
+
+# Must happen BEFORE `import matplotlib.pyplot`. Streamlit Cloud's container
+# has no display server; matplotlib's automatic backend detection can pick
+# (or fail while trying to initialize) an interactive GUI backend that
+# expects one, and depending on the exact backend/version combo that can
+# crash as a segfault rather than a catchable Python exception — which is
+# exactly the "no traceback, just Segmentation fault" symptom this fixes.
+# "Agg" is the standard headless, non-interactive, render-to-buffer backend.
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 from typing import Dict, Any, List
