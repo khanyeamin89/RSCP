@@ -259,7 +259,7 @@ def ask_mistral(prompt: str, max_retries: int = 5, include_ppia: bool = True) ->
         ],
         "response_format": {"type": "json_object"},
         "temperature": 0.1,
-        "max_tokens": 8000
+        "max_tokens": 12000
     }
 
     headers = {
@@ -359,23 +359,114 @@ def ask_mistral(prompt: str, max_retries: int = 5, include_ppia: bool = True) ->
 # FILE PARSING
 # =============================================================================
 
-def extract_text_from_file(file_bytes: bytes, file_name: str) -> str:
+def _detect_header_row(df: "pd.DataFrame", max_scan_rows: int = 8) -> int:
     """
-    Extracts text content from CSV, XLSX, or plain text files.
+    Real-world commissioning spreadsheets often have title rows, merged
+    bilingual headers, or blank spacer rows before the actual column headers
+    appear (seen directly in the uploaded Rooppur files — row 0 is sometimes
+    a title like "List of remaining tests for stage B-1.2", with the real
+    "SL / Task Name" header on row 1). Scans the first few rows and scores
+    each by fill-rate, rewarding rows that are mostly filled with text but
+    PENALIZING long average cell length — title/description text tends to be
+    long sentences, while real column headers tend to be short labels. This
+    disambiguates cases where both a title row and the real header row have
+    the same number of filled cells (a plain fill-rate score alone ties).
+    """
+    best_row = 0
+    best_score = float("-inf")
+    for i in range(min(max_scan_rows, len(df))):
+        row = df.iloc[i]
+        non_null = row.notna().sum()
+        string_cells = [str(v).strip() for v in row if isinstance(v, str) and str(v).strip()]
+        string_like = len(string_cells)
+        avg_len = (sum(len(s) for s in string_cells) / len(string_cells)) if string_cells else 0
+        score = non_null + string_like - (avg_len / 20.0)
+        if score > best_score:
+            best_score = score
+            best_row = i
+    return best_row
+
+
+def _dataframe_to_dense_text(df: "pd.DataFrame", sheet_label: str = "") -> str:
+    """
+    Converts a DataFrame into a compact, AI-friendly "Column: Value" text
+    block — one line per row, only non-empty cells included, real headers
+    detected rather than assumed. This replaces df.to_string(), which pads
+    every column to its widest cell and was measured to be ~85% pure
+    whitespace on real Rooppur tracking sheets (424,871 chars for just 83
+    rows of actual data) — that bloat was silently causing files to need
+    hundreds of AI calls per import, burning through rate limits before
+    getting through a fraction of the data.
+    """
+    if df.empty:
+        return ""
+
+    header_row_idx = _detect_header_row(df)
+    headers = df.iloc[header_row_idx].fillna("").astype(str).tolist()
+    data_rows = df.iloc[header_row_idx + 1:]
+
+    lines = []
+    if sheet_label:
+        lines.append(f"=== Sheet: {sheet_label} ===")
+
+    for _, row in data_rows.iterrows():
+        pairs = []
+        for col_idx, val in enumerate(row):
+            if pd.isna(val):
+                continue
+            val_str = str(val).strip()
+            if not val_str:
+                continue
+            header = headers[col_idx] if col_idx < len(headers) and headers[col_idx].strip() else f"Col{col_idx}"
+            pairs.append(f"{header}: {val_str}")
+        if pairs:
+            lines.append(" | ".join(pairs))
+
+    return "\n".join(lines)
+
+
+def extract_text_from_file(file_bytes: bytes, file_name: str, selected_sheets: Optional[List[str]] = None) -> str:
+    """
+    Extracts text content from CSV, XLSX, or plain text files, in a dense
+    row-oriented format designed for AI extraction (see
+    _dataframe_to_dense_text for why this replaced df.to_string()).
+
+    For Excel files: reads ALL sheets by default, not just the first —
+    pd.read_excel() with no sheet_name defaults to sheet index 0 only, which
+    on real Rooppur files is sometimes a title/cover page ("Титульный лист")
+    while the actual data lives on later sheets.
+
+    Args:
+        selected_sheets: if given, only these sheet names are processed —
+            lets the caller skip huge/irrelevant sheets (title pages,
+            approval routing, summary stats) rather than burning AI calls
+            on them. If None, every non-empty sheet is included.
     """
     file_lower = file_name.lower()
 
     if file_lower.endswith('.csv'):
         try:
             df = pd.read_csv(BytesIO(file_bytes))
-            return df.to_string(index=False)
+            return _dataframe_to_dense_text(df)
         except Exception:
             return file_bytes.decode('utf-8', errors='ignore')
 
     elif file_lower.endswith('.xlsx') or file_lower.endswith('.xls'):
         try:
-            df = pd.read_excel(BytesIO(file_bytes))
-            return df.to_string(index=False)
+            all_sheets = pd.read_excel(BytesIO(file_bytes), sheet_name=None, header=None)
+            text_blocks = []
+            for sheet_name, df in all_sheets.items():
+                if selected_sheets is not None and sheet_name not in selected_sheets:
+                    continue
+                if df.empty or df.dropna(how="all").empty:
+                    continue  # skip genuinely empty sheets (or title-only pages)
+                block = _dataframe_to_dense_text(df, sheet_label=sheet_name)
+                if block.strip():
+                    text_blocks.append(block)
+            if not text_blocks:
+                st.warning(f"'{file_name}' has no readable data in the selected sheet(s).")
+                return ""
+            return "\n\n".join(text_blocks)
         except Exception as e:
             st.error(f"Failed to parse Excel file: {str(e)}")
             return ""
@@ -384,7 +475,19 @@ def extract_text_from_file(file_bytes: bytes, file_name: str) -> str:
         return file_bytes.decode('utf-8', errors='ignore')
 
 
-def smart_chunk_text(text: str, max_chunk_size: int = 8000) -> List[str]:
+def get_sheet_names(file_bytes: bytes, file_name: str) -> List[str]:
+    """Cheaply lists sheet names in an Excel file without loading all the
+    data — used to power the sheet-selection UI before a full import."""
+    if not (file_name.lower().endswith('.xlsx') or file_name.lower().endswith('.xls')):
+        return []
+    try:
+        xl = pd.ExcelFile(BytesIO(file_bytes))
+        return xl.sheet_names
+    except Exception:
+        return []
+
+
+def smart_chunk_text(text: str, max_chunk_size: int = 16000) -> List[str]:
     """
     Chunks text intelligently by trying to preserve record boundaries.
     Falls back to character-based chunking if no clear boundaries found.
@@ -435,6 +538,47 @@ def smart_chunk_text(text: str, max_chunk_size: int = 8000) -> List[str]:
 _KKS_FULL_CODE_RE = re.compile(r'^\d{2}[A-Z]{2,4}\d{2}[A-Z]{2}\d{3}$')
 _KKS_SYSTEM_OR_BUILDING_RE = re.compile(r'^\d{2}(?:U)?[A-Z]{2,4}$')
 _SUFFIX_ONLY_RE = re.compile(r'^\d{2,3}$')  # e.g. "802", "12" — a trailing part only
+
+# Non-anchored versions (with word boundaries) for scanning KKS-shaped tokens
+# embedded inside a larger block of free text, rather than validating one
+# isolated string. Used to ground the AI with the EXACT codes actually
+# present in the source before extraction, instead of relying on it to
+# transcribe long alphanumeric codes correctly from dense text purely from
+# memory/pattern-matching — a common source of subtly wrong codes (e.g.
+# transposed digits) when an LLM free-generates rather than copies.
+_KKS_SCAN_EQUIPMENT_RE = re.compile(r'\b\d{2}[A-Z]{2,4}\d{2}[A-Z]{2}\d{3}\b')
+_KKS_SCAN_SYSTEM_OR_BUILDING_RE = re.compile(r'\b\d{2}U?[A-Z]{2,4}\b')
+
+
+def scan_kks_candidates(text: str, max_candidates: int = 150) -> List[str]:
+    """
+    Deterministically scans a block of text for KKS-shaped substrings
+    (Equipment, Building, or System-only shapes) using regex — no AI
+    involved. Returns a deduplicated, sorted list.
+
+    This is grounding data handed to the AI alongside the raw text: "here
+    are the exact codes we already found mechanically, use these verbatim
+    rather than re-transcribing them" — regex is 100% reliable at finding
+    the right character sequences, while an LLM reading a huge dense chunk
+    can occasionally mistranscribe a digit or letter. Capped at
+    max_candidates to avoid bloating the prompt on extremely dense sheets.
+    """
+    found = set()
+    for m in _KKS_SCAN_EQUIPMENT_RE.finditer(text):
+        found.add(m.group(0))
+    for m in _KKS_SCAN_SYSTEM_OR_BUILDING_RE.finditer(text):
+        # Skip ones that are actually substrings of an already-found longer
+        # equipment code at the same position (avoid double-counting)
+        found.add(m.group(0))
+    # Drop system/building-shaped matches that are just prefixes of a longer
+    # equipment code also found (e.g. don't list "10JAA10" separately from
+    # "10JAA10BB001")
+    equipment_codes = {c for c in found if _KKS_FULL_CODE_RE.match(c)}
+    filtered = {
+        c for c in found
+        if _KKS_FULL_CODE_RE.match(c) or not any(eq.startswith(c) for eq in equipment_codes)
+    }
+    return sorted(filtered)[:max_candidates]
 
 
 def split_comma_separated_kks(system_kks: str) -> List[str]:
@@ -600,7 +744,8 @@ def post_process_ppia_event(event: Dict[str, Any], source: str = "") -> Tuple[Di
 # MAIN PROCESSING PIPELINE
 # =============================================================================
 
-def process_file_smart(file_bytes: bytes, file_name: str, force_reprocess: bool = False) -> Tuple[int, List[str]]:
+def process_file_smart(file_bytes: bytes, file_name: str, force_reprocess: bool = False,
+                        selected_sheets: Optional[List[str]] = None) -> Tuple[int, List[str]]:
     """
     Incremental, idempotent file processing pipeline with real Rooppur NPP KKS validation.
 
@@ -613,6 +758,9 @@ def process_file_smart(file_bytes: bytes, file_name: str, force_reprocess: bool 
             is being re-uploaded — otherwise check_chunk_exists() will still
             report every chunk as already-processed and skip all of them,
             silently producing 0 new records.
+        selected_sheets: for Excel files, only these sheet names are
+            processed — lets the caller skip huge/irrelevant sheets before
+            burning AI calls on them. If None, every non-empty sheet is used.
 
     Returns:
         (records_processed, list of all alert messages)
@@ -620,9 +768,13 @@ def process_file_smart(file_bytes: bytes, file_name: str, force_reprocess: bool 
     all_alerts: List[str] = []
     total_processed = 0
 
-    file_hash = hashlib.md5(file_bytes).hexdigest()
+    # Sheet selection is part of the cache identity — importing the same file
+    # bytes with a different sheet selection must be treated as a different
+    # import, not a cache hit against a previous (different-scope) run.
+    hash_input = file_bytes + (",".join(sorted(selected_sheets)).encode() if selected_sheets else b"")
+    file_hash = hashlib.md5(hash_input).hexdigest()
 
-    raw_text = extract_text_from_file(file_bytes, file_name)
+    raw_text = extract_text_from_file(file_bytes, file_name, selected_sheets=selected_sheets)
     if not raw_text.strip():
         st.error("Could not extract any text from the uploaded file.")
         return 0, ["ERROR: Empty or unreadable file"]
@@ -641,7 +793,20 @@ def process_file_smart(file_bytes: bytes, file_name: str, force_reprocess: bool 
             progress_bar.progress((i + 1) / len(chunks))
             continue
 
-        data = ask_mistral(chunk, include_ppia=False)
+        # Deterministic regex pre-scan: hand the AI the exact codes we already
+        # found mechanically, so it transcribes rather than re-generates them.
+        candidates = scan_kks_candidates(chunk)
+        if candidates:
+            grounded_chunk = (
+                f"KKS CODES DETECTED IN THIS TEXT (found by exact pattern match — use these "
+                f"EXACT codes verbatim wherever they apply, do not alter any digit or letter):\n"
+                f"{', '.join(candidates)}\n\n"
+                f"--- SOURCE TEXT ---\n{chunk}"
+            )
+        else:
+            grounded_chunk = chunk
+
+        data = ask_mistral(grounded_chunk, include_ppia=False)
         if data is None:
             all_alerts.append(f"ERROR: Failed to process chunk {i+1}")
             progress_bar.progress((i + 1) / len(chunks))
@@ -699,7 +864,18 @@ def parse_shift_notes(notes_text: str) -> Tuple[List[Dict[str, Any]], List[Dict[
     if not notes_text or not notes_text.strip():
         return [], [], ["ERROR: Empty shift notes provided"]
 
-    data = ask_mistral(notes_text)
+    candidates = scan_kks_candidates(notes_text)
+    if candidates:
+        grounded_notes = (
+            f"KKS CODES DETECTED IN THIS TEXT (found by exact pattern match — use these "
+            f"EXACT codes verbatim wherever they apply, do not alter any digit or letter):\n"
+            f"{', '.join(candidates)}\n\n"
+            f"--- SOURCE TEXT ---\n{notes_text}"
+        )
+    else:
+        grounded_notes = notes_text
+
+    data = ask_mistral(grounded_notes)
     if data is None:
         return [], [], ["ERROR: AI extraction failed"]
 
