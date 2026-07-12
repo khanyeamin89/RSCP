@@ -34,10 +34,17 @@ from config import (
 # REGISTRY OPERATIONS
 # =============================================================================
 
+@st.cache_data(ttl=20, show_spinner=False)
 def load_registry() -> List[Dict[str, Any]]:
     """
     Loads all records from the registry table.
     Returns empty list on error (with UI notification).
+
+    Cached for 20s: Streamlit reruns the ENTIRE script (all 9 tabs' code,
+    not just the visible tab) on every single interaction anywhere in the
+    app. Without caching, load_registry_df() alone was firing 3+ fresh
+    Supabase queries per click. Any write function below calls
+    load_registry.clear() so edits still show up immediately.
     """
     try:
         supabase = get_supabase_client()
@@ -75,6 +82,7 @@ def clear_registry() -> Tuple[bool, str]:
         # on delete; every row has a non-empty "system" value so this
         # matches (and removes) all of them.
         supabase.table("registry").delete().neq("system", "").execute()
+        load_registry.clear()
         return True, "Registry cleared successfully. All records removed."
     except APIError as e:
         return False, f"Database error clearing registry: {e.message}"
@@ -203,6 +211,7 @@ def upsert_registry_row(row: Dict[str, Any], skip_validation: bool = False) -> T
         ).execute()
 
         messages.append(f"SUCCESS: Record upserted for '{row.get('system', 'Unknown')}' / '{row.get('component', 'Unknown')}'")
+        load_registry.clear()
 
         # Log any milestone changes to history AFTER the upsert succeeds, so
         # we never record a history event for a save that didn't actually go through.
@@ -340,6 +349,7 @@ def upsert_registry_batch(records: List[Dict[str, Any]]) -> Tuple[int, List[str]
 # An append-only event log — separate table from `registry`, no unique-key
 # upsert. Each protection/interlock actuation reported gets its own row.
 
+@st.cache_data(ttl=20, show_spinner=False)
 def load_ppia_log() -> List[Dict[str, Any]]:
     """Loads all records from the ppia_log table, most recent first."""
     try:
@@ -400,6 +410,7 @@ def insert_ppia_entry(entry: Dict[str, Any], skip_validation: bool = False) -> T
     try:
         supabase = get_supabase_client()
         supabase.table("ppia_log").insert(clean_entry).execute()
+        load_ppia_log.clear()
         messages.append(
             f"SUCCESS: PPIA event logged for '{entry.get('system_kks') or entry.get('system', 'Unknown')}'"
         )
@@ -476,6 +487,7 @@ def update_ppia_entry(entry_id: Any, entry: Dict[str, Any], skip_validation: boo
     try:
         supabase = get_supabase_client()
         supabase.table("ppia_log").update(clean_entry).eq("id", entry_id).execute()
+        load_ppia_log.clear()
         messages.append(f"SUCCESS: PPIA event #{entry_id} updated.")
         return True, messages
     except APIError as e:
@@ -525,6 +537,7 @@ def clear_ppia_log() -> Tuple[bool, str]:
         # requires a delete filter, and every row has a non-empty
         # interlock_description, so neq() against it matches (and removes) all.
         supabase.table("ppia_log").delete().neq("interlock_description", "").execute()
+        load_ppia_log.clear()
         return True, "PPIA log cleared successfully. All events removed."
     except APIError as e:
         return False, f"Database error clearing PPIA log: {e.message}"
@@ -565,6 +578,7 @@ def insert_milestone_history_entry(entry: Dict[str, Any], skip_validation: bool 
     try:
         supabase = get_supabase_client()
         supabase.table("milestone_history").insert(clean_entry).execute()
+        load_milestone_history.clear()
         return True, messages
     except APIError as e:
         err_msg = f"Database insert failed: {e.message}"
@@ -576,6 +590,7 @@ def insert_milestone_history_entry(entry: Dict[str, Any], skip_validation: bool 
         return False, messages
 
 
+@st.cache_data(ttl=20, show_spinner=False)
 def load_milestone_history() -> List[Dict[str, Any]]:
     """Loads all milestone test-history events, most recent first."""
     try:
@@ -637,6 +652,7 @@ def clear_milestone_history() -> Tuple[bool, str]:
     try:
         supabase = get_supabase_client()
         supabase.table("milestone_history").delete().neq("milestone", "").execute()
+        load_milestone_history.clear()
         return True, "Milestone test history cleared successfully. All events removed."
     except APIError as e:
         return False, f"Database error clearing milestone history: {e.message}"
