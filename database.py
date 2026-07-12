@@ -433,6 +433,84 @@ def insert_ppia_batch(entries: List[Dict[str, Any]]) -> Tuple[int, List[str]]:
     return success_count, all_messages
 
 
+def update_ppia_entry(entry_id: Any, entry: Dict[str, Any], skip_validation: bool = False) -> Tuple[bool, List[str]]:
+    """
+    Updates an EXISTING PPIA log row by its database id — this is what makes
+    the PPIA Log editable rather than append-only-insert-only. Unlike
+    insert_ppia_entry, this modifies a specific already-saved row instead of
+    always creating a new one.
+
+    Args:
+        entry_id: the row's primary key (from the "id" column Supabase
+            auto-generates — present in every row load_ppia_log() returns)
+        entry: the edited field values to save
+        skip_validation: bypass validation (use with caution)
+
+    Returns:
+        (success: bool, messages: list of info/warning/error strings)
+    """
+    messages: List[str] = []
+
+    if entry_id is None or entry_id == "":
+        messages.append("ERROR: Cannot update a PPIA entry without its row id.")
+        return False, messages
+
+    if not skip_validation:
+        is_valid, issues = validate_ppia_entry(entry)
+        if not is_valid:
+            for issue in issues:
+                messages.append(f"VALIDATION ERROR: {issue}")
+            return False, messages
+        for issue in issues:
+            if issue.startswith("KKS Note:"):
+                messages.append(issue)
+
+    clean_entry = {}
+    for field, field_type in PPIA_LOG_SCHEMA.items():
+        val = entry.get(field)
+        if val is None:
+            clean_entry[field] = "" if field_type == str else None
+        else:
+            clean_entry[field] = str(val) if field_type == str else val
+
+    try:
+        supabase = get_supabase_client()
+        supabase.table("ppia_log").update(clean_entry).eq("id", entry_id).execute()
+        messages.append(f"SUCCESS: PPIA event #{entry_id} updated.")
+        return True, messages
+    except APIError as e:
+        err_msg = f"Database update failed: {e.message}"
+        messages.append(f"ERROR: {err_msg}")
+        st.error(err_msg)
+        return False, messages
+    except Exception as e:
+        err_msg = f"Unexpected error during PPIA update: {str(e)}"
+        messages.append(f"ERROR: {err_msg}")
+        st.error(err_msg)
+        return False, messages
+
+
+def update_ppia_batch(edited_rows: List[Dict[str, Any]]) -> Tuple[int, List[str]]:
+    """
+    Batch update of edited PPIA log rows — each dict must include its "id".
+    Returns (success_count, all_messages).
+    """
+    success_count = 0
+    all_messages: List[str] = []
+
+    if not edited_rows:
+        return 0, ["INFO: No PPIA events to update."]
+
+    for row in edited_rows:
+        row_id = row.get("id")
+        ok, msgs = update_ppia_entry(row_id, row)
+        all_messages.extend(msgs)
+        if ok:
+            success_count += 1
+
+    return success_count, all_messages
+
+
 def clear_ppia_log() -> Tuple[bool, str]:
     """
     Clears ALL records from the ppia_log table. Use with extreme caution —
