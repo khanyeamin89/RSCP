@@ -16,7 +16,7 @@ import pandas as pd
 from io import BytesIO
 from typing import Dict, List, Any, Tuple, Optional
 
-from database import upsert_registry_row, check_chunk_exists, mark_chunk_done, insert_ppia_entry
+from database import upsert_registry_row, check_chunk_exists, mark_chunk_done
 from config import (
     get_kks_scope,
     parse_kks,
@@ -37,10 +37,19 @@ from config import (
 # AI (MISTRAL) API INTEGRATION
 # =============================================================================
 
-def _build_system_prompt() -> str:
+def _build_system_prompt(include_ppia: bool = True) -> str:
     """Builds the extraction system prompt using the real, hard-coded KKS
     reference tables from config.py so the model is grounded in actual
-    Rooppur codes rather than a guessed scheme."""
+    Rooppur codes rather than a guessed scheme.
+
+    Args:
+        include_ppia: whether to ask the model to also extract PPIA events.
+            PPIA extraction is intentionally scoped to the interactive Shift
+            Note Parser only (free-form shift-handover text is where PPIA
+            events actually get reported) — bulk file imports (structured
+            Excel/CSV data) don't ask for it, since those sources are
+            commissioning test records, not shift narratives.
+    """
 
     unit_lines = "\n".join(f"  {k} = {v}" for k, v in UNIT_CODES.items())
     fkey_lines = ", ".join(f"{k}={v}" for k, v in FUNCTION_KEY_LEGEND.items())
@@ -48,6 +57,46 @@ def _build_system_prompt() -> str:
         f"{k}={v.split(' — ')[-1] if ' — ' in v else v}"
         for k, v in list(EQUIPMENT_TYPE_LEGEND.items())[:15]
     )
+    milestone_summary = ", ".join(
+        f"{ms.replace('_status', '').upper()}={MILESTONE_LABELS.get(ms, ms).split('(')[-1].rstrip(')')}"
+        for ms in MILESTONES
+    )
+    # Milestone status/date field pairs, generated from config.py's MILESTONES
+    # list so this never has to be manually kept in sync again (e.g. if the
+    # number of protocol parts changes from P-9 to something else).
+    milestone_fields_json = ",\n".join(
+        f'            "{ms}": "Pending|In Progress|Completed|Failed|N/A",\n'
+        f'            "{MILESTONE_DATE_FIELDS[ms]}": "YYYY-MM-DD or empty string if not found"'
+        for ms in MILESTONES
+    )
+
+    ppia_intro = ""
+    ppia_output_block = ""
+    ppia_rules = ""
+    if include_ppia:
+        ppia_intro = """
+- PPIA = Process Protection and Interlock Actuation. This is DIFFERENT from the milestones above:
+  a PPIA entry is a discrete EVENT report (a protection system tripped, an interlock actuated, a
+  protection alarm occurred) — not a pass/fail commissioning test status. Look for language like
+  "interlock actuated", "protection trip", "PPIA", "reactor trip on...", "actuation of...",
+  "protection system alarmed", etc. Extract each such event as its own entry."""
+        ppia_output_block = """,
+    "ppia_events": [
+        {
+            "system": "System Name",
+            "system_kks": "KKS code if stated, else empty string",
+            "event_date": "YYYY-MM-DD or empty string if not found",
+            "event_time": "HH:MM 24h or empty string if not found",
+            "interlock_description": "What actuated/tripped, in plain language (REQUIRED)",
+            "trigger_cause": "What caused it, if stated, else empty string",
+            "status": "Confirmed|False Alarm|Resolved|Under Investigation|Pending Review",
+            "comments": "Any additional notes"
+        }
+    ]"""
+        ppia_rules = """
+16. "ppia_events" is a SEPARATE list from "records" — a PPIA event is not a milestone status update. If the source mentions no protection/interlock actuations, output an empty list for "ppia_events".
+17. PPIA "status" field: if the shift note doesn't explicitly characterize the event, default to "Pending Review" rather than guessing "Confirmed" or "False Alarm".
+18. "interlock_description" is required for every PPIA event — if you cannot state clearly what actuated/tripped, do not create the entry."""
 
     return f"""You are a nuclear commissioning data extraction expert for the Rooppur NPP project.
 
@@ -64,12 +113,9 @@ KKS CODING RULES (Rooppur NPP Reactor Shop KKS Code Master List):
   (other 2-digit unit codes exist for shared/auxiliary facility zones)
 - System code function keys (1st letter of the system code): {fkey_lines}
 - Common equipment type codes (2 letters, precede the 3-digit sequence number): {common_types}
-- Milestones (COMMISSIONING TESTS - apply to ALL scope types): IT=Individual Test, PIC=Post-Install Cleaning, HT=Hydro Test, PT=Pneumatic Test, SAW=Start-up & Adjustment, P1/P2/P3=Protocol Part 1/2/3 sign-off (paperwork tracking, e.g. "P-3 not signed", "P-1 is checked" — a document being collected/submitted/signed, not a physical test)
-- PPIA = Process Protection and Interlock Actuation. This is DIFFERENT from the milestones above:
-  a PPIA entry is a discrete EVENT report (a protection system tripped, an interlock actuated, a
-  protection alarm occurred) — not a pass/fail commissioning test status. Look for language like
-  "interlock actuated", "protection trip", "PPIA", "reactor trip on...", "actuation of...",
-  "protection system alarmed", etc. Extract each such event as its own entry.
+- Milestones (apply to ALL scope types): {milestone_summary}. IT/PIC/HT/PT/SAW are physical
+  commissioning tests. P1 through P9 track PROTOCOL DOCUMENT sign-off (paperwork, e.g. "P-3 not
+  signed", "P-1 is checked") — not physical tests.{ppia_intro}
 - MULTIPLE CODES IN ONE CELL/SENTENCE: source text often lists several KKS/equipment codes
   together, comma-separated, e.g. "12KAA20AA801, 802, 12KAA10AA801" or "01UYP, 02UYP, 03UYP".
   Create ONE SEPARATE record per code, not one record covering all of them. When a later code in
@@ -89,37 +135,10 @@ OUTPUT FORMAT:
             "scope_type": "System|Equipment|Building",
             "component": "Component Tag",
             "commissioning_stage": "Stage code if present in source (e.g. A, A-1, A-3.1, B-2), else empty string",
-            "it_status": "Pending|In Progress|Completed|Failed|N/A",
-            "it_date": "YYYY-MM-DD or empty string if not found",
-            "pic_status": "Pending|In Progress|Completed|Failed|N/A",
-            "pic_date": "YYYY-MM-DD or empty string if not found",
-            "ht_status": "Pending|In Progress|Completed|Failed|N/A",
-            "ht_date": "YYYY-MM-DD or empty string if not found",
-            "pt_status": "Pending|In Progress|Completed|Failed|N/A",
-            "pt_date": "YYYY-MM-DD or empty string if not found",
-            "saw_status": "Pending|In Progress|Completed|Failed|N/A",
-            "saw_date": "YYYY-MM-DD or empty string if not found",
-            "p1_status": "Pending|In Progress|Completed|Failed|N/A",
-            "p1_date": "YYYY-MM-DD or empty string if not found",
-            "p2_status": "Pending|In Progress|Completed|Failed|N/A",
-            "p2_date": "YYYY-MM-DD or empty string if not found",
-            "p3_status": "Pending|In Progress|Completed|Failed|N/A",
-            "p3_date": "YYYY-MM-DD or empty string if not found",
+{milestone_fields_json},
             "comments": "Any relevant notes including KKS context"
         }}
-    ],
-    "ppia_events": [
-        {{
-            "system": "System Name",
-            "system_kks": "KKS code if stated, else empty string",
-            "event_date": "YYYY-MM-DD or empty string if not found",
-            "event_time": "HH:MM 24h or empty string if not found",
-            "interlock_description": "What actuated/tripped, in plain language (REQUIRED)",
-            "trigger_cause": "What caused it, if stated, else empty string",
-            "status": "Confirmed|False Alarm|Resolved|Under Investigation|Pending Review",
-            "comments": "Any additional notes"
-        }}
-    ]
+    ]{ppia_output_block}
 }}
 
 RULES:
@@ -132,17 +151,14 @@ RULES:
 7. Status keywords: "failed", "rejected", "issue" -> "Failed"
 8. Status keywords: "pending", "not started", "awaiting" -> "Pending"
 9. If a milestone is not mentioned, default to "Pending".
-10. All milestones (IT, PIC, HT, PT, SAW, P1, P2, P3) apply to ALL scope types.
+10. All milestones (IT, PIC, HT, PT, SAW, P1-P9) apply to ALL scope types.
 11. PIC (Post Installation Cleaning) must precede HT (Hydro Test).
 12. Include any anomalies, KKS code issues, or special notes in "comments".
 13. If scope cannot be determined from KKS, infer from context ("system" vs "equipment" vs "building").
 14. Never invent a Unit code — if the shift note doesn't specify one, use "00" (common/shared) and note the assumption in "comments".
-15. For each milestone's companion "_date" field: extract an actual calendar date ONLY if one is explicitly present near that milestone in the source (a completion date, target date, or logged date). Normalize any date format found (DD/MM/YYYY, "5 July 2026", etc.) to YYYY-MM-DD. NEVER invent, guess, or infer a date — if no explicit date is present for that milestone, output an empty string "".
-16. "ppia_events" is a SEPARATE list from "records" — a PPIA event is not a milestone status update. If the source mentions no protection/interlock actuations, output an empty list for "ppia_events".
-17. PPIA "status" field: if the shift note doesn't explicitly characterize the event, default to "Pending Review" rather than guessing "Confirmed" or "False Alarm".
-18. "interlock_description" is required for every PPIA event — if you cannot state clearly what actuated/tripped, do not create the entry.
+15. For each milestone's companion "_date" field: extract an actual calendar date ONLY if one is explicitly present near that milestone in the source (a completion date, target date, or logged date). Normalize any date format found (DD/MM/YYYY, "5 July 2026", etc.) to YYYY-MM-DD. NEVER invent, guess, or infer a date — if no explicit date is present for that milestone, output an empty string "".{ppia_rules}
 19. "commissioning_stage": Rooppur commissioning works are organized into lettered stages with optional numbered sub-stages, including decimal ones — A, A-1, A-2, A-3.1, A-3.2, B, B-1, B-2, etc. Look for a column or label in the source explicitly named "Stage", "Commissioning Stage", "Phase", "Stage of performance", or similar, or an inline mention like "Stage A-1" / "Phase B-2" / "on sub-stage A-1". Extract it exactly as given. If no stage is stated anywhere for a record, output an empty string — NEVER guess or infer a stage from context.
-20. "p1_status"/"p2_status"/"p3_status": these track PROTOCOL DOCUMENT sign-off, distinct from the physical tests. Look for phrases like "Protocol collected", "Protocol submitted", "P-1 signed", "P-3 not signed", "Protocol not submitted". Map: not mentioned/not submitted -> "Pending"; collected but not yet submitted -> "In Progress"; submitted and signed -> "Completed"; rejected/returned -> "Failed".
+20. "p1_status" through "p9_status": these track PROTOCOL DOCUMENT sign-off, distinct from the physical tests. Look for phrases like "Protocol collected", "Protocol submitted", "P-1 signed", "P-3 not signed", "Protocol not submitted", and match to the correct part number. Map: not mentioned/not submitted -> "Pending"; collected but not yet submitted -> "In Progress"; submitted and signed -> "Completed"; rejected/returned -> "Failed".
 21. COMMA-SEPARATED CODE LISTS: never merge multiple codes into a single record's system_kks field. Always split into one record per code, applying the suffix-inheritance reconstruction rule described above where applicable.
 """
 
@@ -202,7 +218,7 @@ def _salvage_truncated_json(content: str) -> Optional[Dict[str, Any]]:
     return None
 
 
-def ask_mistral(prompt: str, max_retries: int = 5) -> Optional[Dict[str, Any]]:
+def ask_mistral(prompt: str, max_retries: int = 5, include_ppia: bool = True) -> Optional[Dict[str, Any]]:
     """
     Mistral La Plateforme API wrapper with JSON enforcement, retry logic, and
     error handling. Uses the free "Experiment" tier (~1B tokens/month, no
@@ -220,6 +236,8 @@ def ask_mistral(prompt: str, max_retries: int = 5) -> Optional[Dict[str, Any]]:
     Args:
         prompt: The text to send to the LLM
         max_retries: Number of retry attempts on failure
+        include_ppia: whether to ask for PPIA event extraction too (see
+            _build_system_prompt docstring — scoped to the Shift Note Parser)
 
     Returns:
         Parsed JSON dict or None on failure
@@ -235,7 +253,7 @@ def ask_mistral(prompt: str, max_retries: int = 5) -> Optional[Dict[str, Any]]:
     payload = {
         "model": _MISTRAL_MODEL,
         "messages": [
-            {"role": "system", "content": _build_system_prompt()},
+            {"role": "system", "content": _build_system_prompt(include_ppia=include_ppia)},
             {"role": "user", "content": prompt}
         ],
         "response_format": {"type": "json_object"},
@@ -622,7 +640,7 @@ def process_file_smart(file_bytes: bytes, file_name: str, force_reprocess: bool 
             progress_bar.progress((i + 1) / len(chunks))
             continue
 
-        data = ask_mistral(chunk)
+        data = ask_mistral(chunk, include_ppia=False)
         if data is None:
             all_alerts.append(f"ERROR: Failed to process chunk {i+1}")
             progress_bar.progress((i + 1) / len(chunks))
@@ -631,7 +649,6 @@ def process_file_smart(file_bytes: bytes, file_name: str, force_reprocess: bool 
         raw_records = data.get("records", [])
         if not raw_records and all(k in data for k in ('system', 'system_kks', 'component')):
             raw_records = [data]
-        ppia_events = data.get("ppia_events", [])
 
         # Expand any comma-separated multi-code records into individual ones
         # BEFORE counting/processing, so "12KAA20AA801, 802" becomes 2 records.
@@ -641,7 +658,7 @@ def process_file_smart(file_bytes: bytes, file_name: str, force_reprocess: bool 
             records.extend(expanded)
             all_alerts.extend(split_alerts)
 
-        st.info(f"Chunk {i+1}: Extracted {len(records)} record(s) (after comma-split), {len(ppia_events)} PPIA event(s).")
+        st.info(f"Chunk {i+1}: Extracted {len(records)} record(s) (after comma-split).")
 
         for record in records:
             record, kks_alerts = post_process_kks_record(record)
@@ -654,12 +671,6 @@ def process_file_smart(file_bytes: bytes, file_name: str, force_reprocess: bool 
             all_alerts.extend(msgs)
             if ok:
                 total_processed += 1
-
-        for event in ppia_events:
-            event, ppia_alerts = post_process_ppia_event(event, source=file_name)
-            all_alerts.extend(ppia_alerts)
-            ok, msgs = insert_ppia_entry(event)
-            all_alerts.extend(msgs)
 
         mark_chunk_done(file_hash, i)
         progress_bar.progress((i + 1) / len(chunks))
