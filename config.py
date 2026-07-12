@@ -557,23 +557,37 @@ MILESTONE_LABELS: Dict[str, str] = {
     "p1_status": "P-1 (Protocol Part 1)",
     "p2_status": "P-2 (Protocol Part 2)",
     "p3_status": "P-3 (Protocol Part 3)",
+    "p4_status": "P-4 (Protocol Part 4)",
+    "p5_status": "P-5 (Protocol Part 5)",
+    "p6_status": "P-6 (Protocol Part 6)",
+    "p7_status": "P-7 (Protocol Part 7)",
+    "p8_status": "P-8 (Protocol Part 8)",
+    "p9_status": "P-9 (Protocol Part 9)",
 }
 
 MILESTONES: List[str] = [
     "it_status", "pic_status", "ht_status", "pt_status", "saw_status",
-    "p1_status", "p2_status", "p3_status",
+    "p1_status", "p2_status", "p3_status", "p4_status", "p5_status",
+    "p6_status", "p7_status", "p8_status", "p9_status",
 ]
 
-# P-1/P-2/P-3 track test-protocol document sign-off (e.g. real remarks seen
-# in Rooppur tracking sheets: "Completed (P-3 not signed)", "P-1 is checked
-# and comments given"). They reuse the same MILESTONES machinery as the 5
-# physical tests above (status, date, history log, timeline) rather than a
-# separate system, since sign-off is itself a trackable event with its own
-# date and can be retried/corrected just like a physical test. The shared
-# status vocabulary maps as: Pending=not submitted, In Progress=collected but
-# not yet submitted/signed, Completed=submitted and signed, Failed=rejected/
-# returned for correction.
-PROTOCOL_MILESTONES: List[str] = ["p1_status", "p2_status", "p3_status"]
+# P-1 through P-9 track test-protocol document sign-off (e.g. real remarks
+# seen in Rooppur tracking sheets: "Completed (P-3 not signed)", "P-1 is
+# checked and comments given"). They reuse the same MILESTONES machinery as
+# the 5 physical tests above (status, date, history log, timeline) rather
+# than a separate system, since sign-off is itself a trackable event with
+# its own date and can be retried/corrected just like a physical test. The
+# shared status vocabulary maps as: Pending=not submitted, In Progress=
+# collected but not yet submitted/signed, Completed=submitted and signed,
+# Failed=rejected/returned for correction.
+PROTOCOL_MILESTONES: List[str] = [f"p{n}_status" for n in range(1, 10)]
+
+# The 5 physical commissioning tests, as opposed to PROTOCOL_MILESTONES
+# (paperwork sign-off). Charts/timeline visualizations deliberately show only
+# these — P-1 through P-9 clutter a graph meant to show physical test
+# progress, even though they're still fully trackable/editable in the
+# Registry Editor, Manual Entry form, and Analytics completion metrics.
+PHYSICAL_TEST_MILESTONES: List[str] = ["it_status", "pic_status", "ht_status", "pt_status", "saw_status"]
 
 # Each milestone's companion date field (target/completion date for that test).
 # Dates are plain "YYYY-MM-DD" strings (or "" if unknown) — kept as str in the
@@ -585,9 +599,7 @@ MILESTONE_DATE_FIELDS: Dict[str, str] = {
     "ht_status": "ht_date",
     "pt_status": "pt_date",
     "saw_status": "saw_date",
-    "p1_status": "p1_date",
-    "p2_status": "p2_date",
-    "p3_status": "p3_date",
+    **{f"p{n}_status": f"p{n}_date" for n in range(1, 10)},
 }
 
 # Valid status values for any milestone
@@ -628,12 +640,7 @@ REGISTRY_SCHEMA: Dict[str, type] = {
     "pt_date": str,
     "saw_status": str,
     "saw_date": str,
-    "p1_status": str,
-    "p1_date": str,
-    "p2_status": str,
-    "p2_date": str,
-    "p3_status": str,
-    "p3_date": str,
+    **{field: str for n in range(1, 10) for field in (f"p{n}_status", f"p{n}_date")},
     "comments": str,
 }
 
